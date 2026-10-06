@@ -867,7 +867,9 @@ found after it (a same-size edit, or a torn re-read) ends the engine, since the 
 A complete atomic replacement that is itself self-consistent and keeps the same sizes is not detected: the file must
 have no writer but this engine. A transfer failure after the device
 writes began ends the engine (`FATAL`) rather than decode from a partial
-state; the server reports `500` and starts it again. A restore does not park the outgoing session. Not supported with
+state; the server reports `500` and starts it again. A restore does not park the outgoing session. `--session-restore-at-start DIR`
+restores `DIR/session.bin` before the engine says `READY` (the file a `RESTORE` would read, typically the
+`--slot-save-path` folder); a refusal logs and starts cold, so a stale or foreign file never blocks a start. Not supported with
 `--layer-split`, `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
 `--prompt-cache 0` (the RAM conversation cache need not be on). On Linux the file
 moves with `O_DIRECT` in 16 MiB blocks when the filesystem takes it (buffered I/O otherwise, or with
