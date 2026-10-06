@@ -7236,8 +7236,9 @@ int main(int argc, char** argv) {
         // One disk session restore: the RESTORE command runs it, and --session-restore-at-start runs it once before
         // READY (the server sends no request before READY, so a startup restore cannot race one).  Returns 0
         // restored, 1 the device state was touched and the restore failed (the caller ends the engine), 2 refused
-        // before any write (the live session, if any, is exactly as it was).
-        auto restore_disk_session = [&](const std::string& path) -> int {
+        // before any write (the live session, if any, is exactly as it was).  `startup` is the flag's call: a
+        // startup restore that failed on the file itself removes it, so a supervisor restart cannot loop on it.
+        auto restore_disk_session = [&](const std::string& path, bool startup) -> int {
             const auto t0 = Clock::now();
             auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
             err.clear();
@@ -7338,7 +7339,7 @@ int main(int argc, char** argv) {
             // K/V sizes the read pass validated and fail-stops once it has written the first block, while a clean
             // refusal sets the live session back
             blocking("transfer", bytes);
-            bool touched = false;
+            bool touched = false, device_failed = false;
             auto sink = [&](size_t layer, size_t part, uint64_t offset, const void* data, size_t n) {
                 // belt-and-braces: the apply pass is bound to the read pass (file_kv), so this layer index is
                 // always one of the validated targets; refuse rather than index out of range if that ever breaks
@@ -7347,7 +7348,11 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 touched = true;
-                return targets[layer].apply(part, offset, data, n, err);
+                if (!targets[layer].apply(part, offset, data, n, err)) {
+                    device_failed = true;   // the copy failed, not the file walk: the store may be fine
+                    return false;
+                }
+                return true;
             };
             strata::core::SessionStatus st2;
             if (!strata::core::session_file_apply_streamed(path, id, sink, file_kv, err, &st2)) {
@@ -7355,6 +7360,18 @@ int main(int argc, char** argv) {
                     // the file changed or failed before the first block: the session is as it was
                     live_ok = true;
                     return refuse(err, st2.error);
+                }
+                // A startup restore that failed on the file itself (the apply pass's walk, not a device copy) would
+                // fail the same way on every boot, and the supervisor would restart into it forever: remove the
+                // file so the next start is cold.  Only the startup path, only the flag's own file, only
+                // file-attributable failures - a device-side failure is not cured by losing the store.
+                if (startup && !device_failed) {
+                    if (std::remove(path.c_str()) == 0)
+                        std::fprintf(stderr, "strata serve: --session-restore-at-start: removed %s (it failed this "
+                                             "startup restore)\n", path.c_str());
+                    else
+                        std::fprintf(stderr, "strata serve: --session-restore-at-start: %s failed this startup "
+                                             "restore and could not be removed\n", path.c_str());
                 }
                 // some of the K/V is written: never decode from a partial state; the server starts again
                 std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s\n", path.c_str(), err.c_str());
@@ -7395,7 +7412,7 @@ int main(int argc, char** argv) {
             std::string dir = o.session_restore_at_start;
             while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\')) dir.pop_back();
             const std::string start_file = dir + "/session.bin";
-            const int rc = restore_disk_session(start_file);
+            const int rc = restore_disk_session(start_file, true);
             if (rc == 1) return 1;   // the store left the device state touched: never serve from it
             if (rc == 2)
                 std::fprintf(stderr, "strata serve: --session-restore-at-start: %s refused; starting cold\n",
@@ -7987,7 +8004,7 @@ int main(int argc, char** argv) {
                 const bool save = line[0] == 'S';
                 const std::string path = line.substr(save ? 5 : 8);
                 if (!save) {
-                    const int rc = restore_disk_session(path);
+                    const int rc = restore_disk_session(path, false);
                     if (rc == 1) return 1;   // the device state was touched: never continue
                     continue;
                 }
