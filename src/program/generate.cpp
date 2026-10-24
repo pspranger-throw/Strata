@@ -11173,37 +11173,69 @@ int main(int argc, char** argv) {
         // restored, 1 the device state was touched and the restore failed (the caller ends the engine), 2 refused
         // before any write (the live session, if any, is exactly as it was).  `startup` is the flag's call: a
         // startup restore that failed on the file itself removes it, so a supervisor restart cannot loop on it.
+        // Shared session-verb protocol surface (hardening ①, 2026-10-18 review; landed this hop): ONE
+        // protocol emitter, gate list and identity preamble for both the SAVE verb body and
+        // restore_disk_session.  The RESTORE verb delegates to restore_disk_session, so the only
+        // remaining consumer of the save-side trio is SAVE itself; before this, every field of the
+        // trio/gates/preamble existed twice and drifted silently (the lambda hard-coded published=0
+        // while the save side carried the protocol field).  Refuse wording, SERR/SESSION/SWAIT lines
+        // and per-side ordering are byte-identical to before the hoist.
+        auto sess_refuse = [&](const char* verb, const std::string& path, const std::string& why,
+                               strata::core::SessionError kind, bool published) {
+            std::fprintf(stderr, "strata serve: session %s %s: %s\n", verb, path.c_str(), why.c_str());
+            std::string one = why;   // one protocol line
+            for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
+            std::printf("SERR %s %d %s\n", strata::core::session_error_name(kind), published ? 1 : 0, one.c_str());
+            std::fflush(stdout);
+            err.clear();
+        };
+        auto sess_gate = [&](const std::string& path, std::string& why) -> bool {   // true = refused
+            if (path.empty()) { why = "missing path"; return true; }
+            if (!stages.empty() || multi_gpu) { why = "session files do not support --layer-split"; return true; }
+            if (o.batch > 0) { why = "session files do not support --batch (parallel requests)"; return true; }
+            if (o.prompt_cache <= 0) { why = "session files need --prompt-cache > 0"; return true; }
+            return false;
+        };
+        auto sess_blocking = [&](const char* phase, uint64_t bytes) {
+            const int64_t s = strata::core::session_phase_limit_s(bytes);
+            strata::core::progress_at(phase);
+            strata::core::progress_allow(s);
+            std::printf("SWAIT %s %lld\n", phase, (long long) s);
+            std::fflush(stdout);
+        };
+        auto sess_moving = [&](const char* label, uint64_t done, uint64_t total) {
+            strata::core::progress_at(label, (int64_t) (done >> 20));
+            strata::core::progress_allow(0);   // a block moved: the ordinary watchdog limit again, and a beat
+            std::printf("SESSION %llu %llu\n", (unsigned long long) done, (unsigned long long) total);
+            std::fflush(stdout);
+        };
+        auto sess_identity = [&](strata::core::SessionFileIdentity& id, std::string& why,
+                                 strata::core::SessionError& kind) -> bool {
+            try {
+                if (!session_identity(id, why, [&] { sess_blocking("fingerprint", 2u << 20); })) {
+                    kind = strata::core::SessionError::io;
+                    return false;
+                }
+                return true;
+            } catch (const std::bad_alloc&) {
+                why = "session identity: out of memory"; kind = strata::core::SessionError::memory; return false;
+            } catch (const std::exception& e) {
+                why = "session identity: " + std::string(e.what()); kind = strata::core::SessionError::io; return false;
+            }
+        };
         auto restore_disk_session = [&](const std::string& path, bool startup) -> int {
             const auto t0 = Clock::now();
             auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
             err.clear();
-            auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid) {
-                std::fprintf(stderr, "strata serve: session restore %s: %s\n", path.c_str(), why.c_str());
-                std::string one = why;   // one protocol line
-                for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
-                std::printf("SERR %s 0 %s\n", strata::core::session_error_name(kind), one.c_str());
-                std::fflush(stdout);
-                err.clear();
+            auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
+                              bool published = false) {
+                sess_refuse("restore", path, why, kind, published);
                 return 2;
             };
-            auto moving = [&](uint64_t done, uint64_t total) {
-                strata::core::progress_at("reading a session file, MiB", (int64_t) (done >> 20));
-                strata::core::progress_allow(0);   // a block moved: the ordinary watchdog limit again, and a beat
-                std::printf("SESSION %llu %llu\n", (unsigned long long) done, (unsigned long long) total);
-                std::fflush(stdout);
-            };
-            // a step that blocks in one call: its explicit allowance, on both sides, announced before it starts
-            auto blocking = [&](const char* phase, uint64_t bytes) {
-                const int64_t s = strata::core::session_phase_limit_s(bytes);
-                strata::core::progress_at(phase);
-                strata::core::progress_allow(s);
-                std::printf("SWAIT %s %lld\n", phase, (long long) s);
-                std::fflush(stdout);
-            };
-            if (path.empty()) return refuse("missing path");
-            if (!stages.empty() || multi_gpu) return refuse("session files do not support --layer-split");
-            if (o.batch > 0) return refuse("session files do not support --batch (parallel requests)");
-            if (o.prompt_cache <= 0) return refuse("session files need --prompt-cache > 0");
+            auto moving = [&](uint64_t done, uint64_t total) { sess_moving("reading a session file, MiB", done, total); };
+            auto blocking = [&](const char* phase, uint64_t bytes) { sess_blocking(phase, bytes); };
+            std::string gate_why;
+            if (sess_gate(path, gate_why)) return refuse(gate_why);
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 std::fflush(stdout);
@@ -11211,14 +11243,8 @@ int main(int argc, char** argv) {
             }
             strata::core::progress_at("restoring a session");
             strata::core::SessionFileIdentity id;
-            try {
-                if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); }))
-                    return refuse(err, strata::core::SessionError::io);
-            } catch (const std::bad_alloc&) {
-                return refuse("session identity: out of memory", strata::core::SessionError::memory);
-            } catch (const std::exception& e) {
-                return refuse(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
-            }
+            strata::core::SessionError ikind = strata::core::SessionError::invalid;
+            if (!sess_identity(id, err, ikind)) return refuse(err, ikind);
             // Streaming restore: the read pass parses and checks the whole file without materializing the K/V (it
             // stays on disk), the metadata is validated against this engine, then the apply pass reads the file
             // again and copies every K/V block into its authoritative pool.  Peak RAM is two 16 MiB blocks and the
@@ -11249,7 +11275,7 @@ int main(int argc, char** argv) {
                 }
                 strata::core::SessionStatus st;
                 if (!strata::core::session_file_read_streamed(path, id, image, bytes, err, limits, &file_kv, &st))
-                    return refuse(err, st.error);
+                    return refuse(err, st.error, st.published);   // ①: report the core's published flag, not a hard-coded 0
             } catch (const std::bad_alloc&) {
                 return refuse("not enough RAM to read the session", strata::core::SessionError::memory);
             }
@@ -12274,52 +12300,21 @@ int main(int argc, char** argv) {
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
-                                  bool published = false) {
-                    std::fprintf(stderr, "strata serve: session %s %s: %s\n", save ? "save" : "restore", path.c_str(),
-                                 why.c_str());
-                    std::string one = why;   // one protocol line
-                    for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
-                    std::printf("SERR %s %d %s\n", strata::core::session_error_name(kind), published ? 1 : 0, one.c_str());
-                    std::fflush(stdout);
-                    err.clear();
-                };
+                                  bool published = false) { sess_refuse(save ? "save" : "restore", path, why, kind, published); };
                 auto moving = [&](uint64_t done, uint64_t total) {
-                    strata::core::progress_at(save ? "writing a session file, MiB" : "reading a session file, MiB",
-                                              (int64_t) (done >> 20));
-                    strata::core::progress_allow(0);   // a block moved: the ordinary watchdog limit again, and a beat
-                    std::printf("SESSION %llu %llu\n", (unsigned long long) done, (unsigned long long) total);
-                    std::fflush(stdout);
+                    sess_moving(save ? "writing a session file, MiB" : "reading a session file, MiB", done, total);
                 };
-                // a step that blocks in one call: its explicit allowance, on both sides, announced before it starts
-                auto blocking = [&](const char* phase, uint64_t bytes) {
-                    const int64_t s = strata::core::session_phase_limit_s(bytes);
-                    strata::core::progress_at(phase);
-                    strata::core::progress_allow(s);
-                    std::printf("SWAIT %s %lld\n", phase, (long long) s);
-                    std::fflush(stdout);
-                };
+                auto blocking = [&](const char* phase, uint64_t bytes) { sess_blocking(phase, bytes); };
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
-                if (path.empty()) { refuse("missing path"); continue; }
-                if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
-                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
-                if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
+                std::string gate_why;
+                if (sess_gate(path, gate_why)) { refuse(gate_why); continue; }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
                 strata::core::SessionFileIdentity id;
-                try {
-                    if (!session_identity(id, err, [&] { blocking("fingerprint", 2u << 20); })) {
-                        refuse(err, strata::core::SessionError::io);
-                        continue;
-                    }
-                } catch (const std::bad_alloc&) {
-                    refuse("session identity: out of memory", strata::core::SessionError::memory);
-                    continue;
-                } catch (const std::exception& e) {
-                    refuse(std::string("session identity: ") + e.what(), strata::core::SessionError::io);
-                    continue;
-                }
+                strata::core::SessionError ikind = strata::core::SessionError::invalid;
+                if (!sess_identity(id, err, ikind)) { refuse(err, ikind); continue; }
                 {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
