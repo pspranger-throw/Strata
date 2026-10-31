@@ -77,6 +77,30 @@ def python_failure(lines: list[str]) -> str | None:
     return None
 
 
+DEEPSEEK_ENGINE_LINE = re.compile(r"(A newer DeepSeek engine (?:is available|may be available)[^\r\n]*|DeepSeek engine updated from [^\r\n]*)")
+
+
+def deepseek_engine_note(line: str) -> tuple[str, str] | None:
+    """setup's line about the DeepSeek engine upgrade ("A newer DeepSeek engine is available but could not be installed: ...; still using X",
+    or "DeepSeek engine updated from X to Y"): ("warn" | "info", the sentence), None for any other line. The failure line must reach the
+    person: the model starts with the engine they have, and they should know there is a newer one."""
+    found = DEEPSEEK_ENGINE_LINE.search(line)
+    if not found:
+        return None
+    text = found.group(1).strip()
+    return ("info" if text.startswith("DeepSeek engine updated") else "warn", text)
+
+
+def argparse_failure(lines: list[str]) -> str:
+    """setup.py's own refusal of an option ("setup.py: error: argument --kv: invalid choice: ..."), which is neither an [X] line nor a
+    traceback (#3785): the words after "error:" are the cause."""
+    for line in reversed(lines):
+        found = re.match(r"\s*(?:setup|strata)(?:\.py)?: error: (.+)", line)
+        if found:
+            return found.group(1).strip()[:300]
+    return ""
+
+
 def missing_file(failure: str) -> bool:
     """An import or file error: the install itself is short of a file, which an update of Strata brings back."""
     return failure.startswith(("ModuleNotFoundError", "ImportError", "FileNotFoundError"))
@@ -99,6 +123,7 @@ def setup_failure(lines: list[str], err: str, hint: str, details: str | None, ow
     """The error for a setup.py run that exited non-zero. setup.py's own `[X]` line (err) is the message when there is one; when it
     stopped with a Python error instead, that error's last line is (#3613, #3467: a file missing from the Terminal's tools/ ended every
     launch after a tune with only "The model could not be installed"). `details` is the file that holds the rest of its output."""
+    err = err or argparse_failure(lines)
     crashed = python_failure(lines) if not err else None
     if crashed:
         where = f" The whole setup output is in {details}." if details else ""
@@ -216,6 +241,11 @@ def tune_words(result: dict | None, code: int | None = None) -> tuple[str, str]:
 
 # ----------------------------------------------------------------------------------------------- run config
 
+def runtime_max_wait() -> int:
+    from strata_control import runtime
+    return int(runtime.MAX_START_WAIT)
+
+
 def read_config(path: Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
@@ -284,7 +314,10 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
     kv = s.kv or ("int8" if (s.context or 32768) > 8192 else "fp16")
     if "--kv" in args or s.kv:
         put("--kv", kv)
-    if s.vision == "off":
+    if cfg.get("arch") == "deepseek41":                      # the engine's own tower: --vision on / off is its whole picture setting
+        if s.vision:
+            put("--vision", "off" if s.vision == "off" else "on")
+    elif s.vision == "off":
         args = [a for a in args if a != "--vision"]
         cfg.pop("vision", None)                              # the picture reader's own settings: the server adds --vision for them
     elif s.vision and "--vision" not in args:
@@ -323,10 +356,14 @@ def apply_cards(cfg: dict, gpus: "list[int] | dict | None") -> None:
         cfg.pop("layer_split", None)
 
 
-def installed_cards(base: dict | None) -> list[int] | None:
+def installed_cards(base: dict | None, usable: list[dict] | None = None) -> list[int] | None:
     """The cards the installed model's own config names after a choice (setup --gpu / --gpus, the app's card pick: "gpus_asked"), in its order;
-    None when it names none or was never asked."""
+    None when it names none or was never asked, or when setup picked them itself (strata_control/gpu_pick.py: a DeepSeek config of setup 0.2.8
+    and earlier marks setup's one-card pick as asked; `usable`: the cards that count on this PC, needed to tell the two apart)."""
     if not isinstance(base, dict) or not (base.get("gpus_asked") or base.get("gpu_roles")):
+        return None
+    from strata_control import gpu_pick
+    if not gpu_pick.chosen_by_person(base, usable):
         return None
     g = base.get("gpu")
     if g is None or g == "":
@@ -354,7 +391,11 @@ def cards_for_launch(s: S.LaunchSettings, catalog, ram_gb: float | None = None, 
             return None
     if s.gpus:
         return [int(g) for g in s.gpus]
-    if installed_cards(base) or (isinstance(base, dict) and base.get("gpu_roles")):
+    try:
+        usable_now = catalog.computer().usable_gpus
+    except Exception:                                        # noqa: BLE001 - without the card list a saved card is kept, as before
+        usable_now = None
+    if installed_cards(base, usable_now) or (isinstance(base, dict) and base.get("gpu_roles")):
         return None
     try:
         from strata_control import gpu_roles
@@ -362,13 +403,126 @@ def cards_for_launch(s: S.LaunchSettings, catalog, ram_gb: float | None = None, 
         if len(comp.usable_gpus) < 2:
             return None
         cards = gpu_roles.rows(comp.gpus, comp.engine_vendor)
+        if comp.engine_vendor == "amd" and ((isinstance(base, dict) and base.get("arch") == "deepseek41")
+                                            or getattr(s, "family", None) == "deepseek41"):
+            # DeepSeek on AMD: the cards setup and `--plan` use (strata_control/dsv41_fit.run_cards): one card on Windows, only cards the engine
+            # package runs, no integrated chip beside a card with memory of its own
+            from strata_control import dsv41_fit
+            ids = [int(c["index"]) for c in dsv41_fit.run_cards(comp.usable_gpus, comp.engine_vendor)[0]]
+            if len(ids) < 2:
+                return ids or None                           # pinned to that card, exactly as setup pins it
+            cards = [c for c in cards if int(c.get("index", 0)) in ids]
         rec = gpu_roles.recommend(cards, comp.engine_vendor)["roles"]
         return gpu_roles.order(rec, cards) or None
     except Exception:                                        # noqa: BLE001 - never block a launch over the choice of cards
         return None
 
 
-def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None) -> dict:
+EXPERTS_MIN_ENGINE = (0, 1, 50)      # the first DeepSeek engine that accepts --experts (0.1.49.2, the one shipped before, does not)
+
+
+def dsv41_engine_version(exe) -> tuple:
+    """The version of a DeepSeek engine: from its package folder's name ("0.1.50-windows-x86_64-cuda-cuda13"), else what `--version` prints;
+    () when neither says."""
+    if not exe:
+        return ()
+    from strata_control import dsv41_engine
+    folder = Path(str(exe)).parent.name
+    version = dsv41_engine.version_key(folder) if folder[:1].isdigit() else ()
+    if version:
+        return version
+    try:
+        done = subprocess.run([str(exe), "--version"], capture_output=True, text=True, errors="replace", timeout=10, stdin=subprocess.DEVNULL)
+        found = re.search(r"(\d+\.\d+\.\d+(?:\.\d+)?)", (done.stdout or "") + (done.stderr or ""))
+        return tuple(int(x) for x in found.group(1).split(".")) if found else ()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ()
+
+
+def engine_takes_experts(exe) -> bool:
+    """Does this DeepSeek engine accept --experts (0.1.50 or newer)? An engine whose version cannot be told counts as not: nothing is passed,
+    nothing is shown, no error."""
+    return dsv41_engine_version(exe) >= EXPERTS_MIN_ENGINE
+
+
+def used_cards(computer, s: "S.LaunchSettings") -> list:
+    """The cards this launch uses: the ones named (--gpu, the Cards step; a role other than off), else every card that can be used."""
+    cards = list(computer.usable_gpus)
+    chosen = None
+    if s.gpu_roles:
+        chosen = {int(k) for k, v in s.gpu_roles.items() if str(v) != "off"}
+    elif s.gpus:
+        chosen = {int(g) for g in s.gpus}
+    if chosen is not None:
+        cards = [c for c in cards if int(c.get("index", 0)) in chosen]
+    return cards
+
+
+def used_vram_gb(computer, s: "S.LaunchSettings") -> float:
+    """Graphics memory (GiB) of the cards this launch uses, summed as the engine sums it."""
+    return sum(float(c.get("vram_gb") or 0) for c in used_cards(computer, s))
+
+
+def uses_integrated_gpu(computer, s: "S.LaunchSettings") -> bool:
+    """Does the launch run on an integrated / unified-memory GPU (Strix Halo, gfx1151, Radeon 8060S: the hardware probe marks it uma, integrated or
+    unified_memory)? A Mac is left out: DeepSeek is not on the Mac."""
+    for c in used_cards(computer, s):
+        if str(c.get("vendor")) == "apple" or c.get("unified_gb"):
+            continue
+        if c.get("integrated") or c.get("uma") or c.get("unified_memory"):
+            return True
+    return False
+
+
+def faster_by_default(computer, s: "S.LaunchSettings") -> bool:
+    """The engine's `--experts auto` rule: Faster (5 experts) on an integrated GPU, or when the cards used total 16 GiB or less."""
+    return uses_integrated_gpu(computer, s) or S.faster_default(used_vram_gb(computer, s))
+
+
+EXPERTS_LINE = re.compile(r"experts per word: (\d+)")
+
+
+def experts_from_log(path) -> int | None:
+    """The engine's own answer, read back from its startup line "experts per word: N" (the last one in the log), None when it is not there."""
+    try:
+        data = Path(path).read_bytes()[-262144:].decode("utf-8", "replace")
+    except (OSError, TypeError, ValueError):
+        return None
+    found = EXPERTS_LINE.findall(data)
+    return int(found[-1]) if found else None
+
+
+def apply_experts(cfg: dict, experts: int | None) -> None:
+    """DeepSeek's speed choice as the engine flag: --experts 5 (Faster) or --experts 6 (Full quality), replacing one already in the saved args."""
+    if experts is None or not isinstance(cfg.get("args"), list):
+        return
+    args, out, i = [str(x) for x in cfg["args"]], [], 0
+    while i < len(args):
+        if args[i] == "--experts":
+            i += 2
+            continue
+        if args[i].startswith("--experts="):
+            i += 1
+            continue
+        out.append(args[i])
+        i += 1
+    cfg["args"] = out + ["--experts", str(int(experts))]
+
+
+_SETUP_LOG_NAME = re.compile(r"^strata-[A-Za-z0-9_.-]+\.log$")
+
+
+def own_log_path(base: dict) -> str | None:
+    """The log path a person wrote into the model's config themselves (#3656): setup names its own `strata-<model>.log`, so any other
+    name is theirs and a launch keeps it instead of writing its per-profile log file."""
+    value = base.get("log")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return None if _SETUP_LOG_NAME.match(Path(value.replace("\\", "/")).name) else value
+
+
+def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None,
+                  experts: int | None = None) -> dict:
     """The private run config of this launch: the installed one plus the choices that are not setup's (host, port, key, cards, advanced)."""
     from strata_control import tune_knobs
     cfg = json.loads(json.dumps(base))
@@ -386,7 +540,7 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
     cfg["open_browser"] = False                              # strata launch never opens a browser by itself (only `--open` does, after the start)
     if isinstance(cfg.get("args"), list):
         cfg["args"] = [a for a in cfg["args"] if a != "--open"]
-    if log:
+    if log and not own_log_path(base):
         cfg["log"] = log
     apply_cards(cfg, gpus)
     from strata_control import drafting as _drafting
@@ -397,6 +551,9 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         draft_layer.apply(cfg)
     elif s.mtp == "on":
         cfg["mtp"] = True
+    if cfg.get("backend") == "sycl":                         # exactly two Arc B-series cards: --spec 2 (strata_control/intel_spec.py); the person's
+        from strata_control import intel_spec                # own choices (user_args, an extra option below) come after it and win
+        intel_spec.apply_for_launch(cfg)
     if s.extra:
         a_changes, e_changes = S.as_argv_changes(s.extra, bool_flags)
         cfg["args"] = tune_knobs.apply_to_argv([str(x) for x in cfg.get("args") or []], a_changes)
@@ -404,6 +561,7 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
             cfg["env"] = tune_knobs.apply_to_env(dict(cfg.get("env") or {}), e_changes)
     from strata_control import draft_layer
     draft_layer.apply(cfg)                                   # "mtp": false (from the installed config too) never sits beside --mtp in the saved args (B10)
+    apply_experts(cfg, experts)
     return cfg
 
 
@@ -482,6 +640,7 @@ class Runner:
         self.hardware_override = hardware
         self.children: list[subprocess.Popen] = []
         self.notices: list[str] = []
+        self._engine_notes: set[str] = set()
         self.identity_notes: list[str] = []
         self.tune_result: dict | None = None
         self.config_path: Path | None = None
@@ -542,8 +701,22 @@ class Runner:
     def _cli(self, *args: str) -> list[str]:
         return [self.python, str(ROOT / "strata.py"), *args]
 
+    def warn_wsl_amd(self) -> None:
+        """Under WSL the Linux AMD engines hang (no /dev/kfd, librocdxg never completes a GPU command): say so plainly with one next step,
+        and go on (a warning, never a refusal)."""
+        try:
+            from strata_control import engine_component as ec
+            note = ec.wsl_amd_note("hip") and ec.wsl_amd_note(ec.detect_backend()[0])    # the cheap file test first: no GPU tool is run on other systems
+        except Exception:                                    # noqa: BLE001 - a nicety, never a reason to stop
+            return
+        if note:
+            self.emit("engine", note, level="warn")
+            if note not in self.notices:
+                self.notices.append(note)
+
     # ---- 1. the engine
     def ensure_engine(self) -> None:
+        self.warn_wsl_amd()
         if self.multi_file():                                # DeepSeek: its own engine package (setup fetches it); the Strata engine is not used
             self.emit("engine", "DeepSeek runs on its own engine package, so the Strata engine is not downloaded for it.", 100)
             return
@@ -727,6 +900,10 @@ class Runner:
     def setup_args(self) -> list[str]:
         cat, s = self.catalog, self.s
         fam, model = s.family, s.model
+        try:                     # a saved preset or choices file keeps the lower-case tag ("iq3_xxs", #4209), while setup's
+            fam, model = cat.resolve(str(model), None if fam is None else str(fam))    # --model takes the table's own key
+        except Exception:        # noqa: BLE001  a name the list does not hold, or a list that cannot be read here, is setup's
+            pass                 # to report: passing the values on unchanged keeps the launch behaving as it did before
         args = ["--yes", "--no-start", "--family", str(fam), "--model", str(model)]
         ctx = s.context
         if ctx:
@@ -751,6 +928,8 @@ class Runner:
             args += ["--gguf-dir", str(p if p.is_dir() else p.parent)]
         if s.dsv41_package and s.family == "deepseek41":
             args += ["--dsv41-package", s.dsv41_package]
+        if self.feed:                                     # --feed / STRATA_UPDATE_FEED: setup fetches the DeepSeek engine from it too
+            args += ["--feed", str(self.feed)]
         if s.gpu_roles:
             args += ["--gpu-roles", ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0])))]
         elif s.gpus:
@@ -760,7 +939,7 @@ class Runner:
         if sys.platform == "darwin":
             # a Mac's setup (Control mode, strata_control/mac_fit.py) takes fewer options (no --kv, --gpu, speed projection)
             keep = {"--yes", "--no-start", "--family", "--model", "--context", "--vision", "--data-dir", "--gguf-dir", "--move-data",
-                    "--set-default-data-dir"}
+                    "--set-default-data-dir", "--feed", "--dsv41-package"}   # (the last two: the DeepSeek engine package, 0.2.7.1)
             flags = ("--yes", "--no-start", "--move-data", "--set-default-data-dir")
             out, i = [], 0
             while i < len(args):
@@ -786,7 +965,11 @@ class Runner:
             roles = base.get("gpu_roles")
             if isinstance(roles, dict) and roles:
                 return ["--gpu-roles", ",".join(f"{k}={v}" for k, v in sorted(roles.items(), key=lambda kv: int(kv[0])))]
-            cards = installed_cards(base)
+            try:
+                usable_now = self.catalog.computer().usable_gpus
+            except Exception:                                # noqa: BLE001
+                usable_now = None
+            cards = installed_cards(base, usable_now)
             if cards:
                 return ["--gpus", ",".join(str(g) for g in cards)] if len(cards) > 1 else ["--gpu", str(cards[0])]
         except Exception:                                    # noqa: BLE001 - never block a launch over remembering the cards
@@ -872,6 +1055,17 @@ class Runner:
         except Exception:                                    # noqa: BLE001
             return 0.0
 
+    def start_wait(self) -> int:
+        """How long the start waits for the model to be ready (#3949 #3459): 10 minutes, more for a big model, which a slow disk needs
+        longer to read (about 8 more seconds per GB above 40 GB, at most 30 minutes). Automatic: nobody sets a variable for it."""
+        gb = 0.0
+        try:
+            row = next((r for r in self.catalog.rows() if r.family == self.s.family and r.model == self.s.model), None)
+            gb = float(getattr(row, "download_gb", 0) or 0)
+        except Exception:                                    # noqa: BLE001
+            gb = 0.0
+        return int(min(runtime_max_wait(), max(600, 600 + (gb - 40.0) * 8.0)))
+
     def download_question(self) -> tuple[str, str]:
         """(title, text) of the question before a download starts, naming exactly what is fetched."""
         return self.model_state().question()
@@ -909,7 +1103,7 @@ class Runner:
         s, cat = self.s, self.catalog
         data = Path(s.data_dir) if s.data_dir else (self.existing_data_dir() or cat.data_dir())
         models_dir = data / "models"
-        job = {"folder": str(models_dir / cat.tag_of(s.family, s.model)),
+        job = {"folder": str(cat.model_folder(data, s.family, s.model)),
                "total_gb": float(next((r.download_gb for r in cat.rows() if r.family == s.family and r.model == s.model), 0) or 0)}
         try:
             setup_module = cat.strata.setup_module()
@@ -976,6 +1170,12 @@ class Runner:
                 continue
             lines.append(line)
             lines[:] = lines[-1500:]
+            note = deepseek_engine_note(line)
+            if note and note[1] not in self._engine_notes:   # setup's DeepSeek engine lines are shown, not condensed away (0.2.5 list)
+                self._engine_notes.add(note[1])
+                if note[0] == "warn":
+                    self.notices.append(note[1])
+                self.emit("model", note[1], None, level=note[0], step=step_seen)
             prog = cat.mcp.install_progress(lines)
             prog = cat.mcp.combined_progress(prog, job)
             dl, phase, label = prog.get("download"), prog.get("phase"), prog.get("label")
@@ -1107,7 +1307,7 @@ class Runner:
             d = fam["models"][m]
             subs = [d.get("subdir"), d.get("legacy_subdir"), m]
             folders = [p, *[p / x for x in subs if x]] if p.is_dir() else [p.parent]
-            names = [n for s in d["shards"] for n in (s, legacy.get(s)) if n]
+            names = [n for s in d["shards"] for n in (s, legacy.get(s)) if n] + list(d.get("shards6") or [])      # (+ the six-shard layout of 2026-10-27)
             folder = next((f for f in folders if any((f / n).exists() for n in names)), None)
             if folder is not None:
                 return m, d, folder
@@ -1130,14 +1330,17 @@ class Runner:
         if found is None:
             return False
         model, d, folder = found
+        from strata_control import dsv41_fit
+        if dsv41_fit.not_here(model):     # Mac: no Metal IQ1_S kernel yet; DGX Spark: never run; said before an engine or a download is touched
+            raise LaunchError(dsv41_fit.not_here(model),
+                              "Use the 2.00 or 2.25 files (--model ist-das-2.00bpw or --model ist-das-2.25bpw, or --model-path to those files). "
+                              "Nothing was downloaded or changed.", 2)
         if s.family and s.family != "deepseek41":
             raise LaunchError(f"These are DeepSeek-V4.1-Flash's files, not {s.family} {s.model}'s.",
                               "Leave --model out, or use --model " + model + ".", 2)
-        others = list(d["shards"])
-        legacy = getattr(mod, "DSV41_LEGACY_NAMES", {})
-        missing = [n for n in others if not (folder / n).exists() and not (legacy.get(n) and (folder / legacy[n]).exists())]
+        _layout, others, missing = mod.dsv41_parts(d, lambda n: (folder / n).exists())      # the pinned four-shard layout, or ISTA's six-shard one (0.2.8.1)
         if missing:
-            parts = {4: "four", 9: "nine"}.get(len(others), str(len(others)))
+            parts = {4: "four", 5: "five", 9: "nine"}.get(len(others), str(len(others)))
             raise LaunchError(f"DeepSeek-V4.1-Flash {d.get('label', model)} is in {parts} parts and {len(missing)} of them are not in {folder} "
                               f"(first missing: {missing[0]}).",
                               "Put every part in the folder (or drop --model-path and let Strata download them). "
@@ -1237,16 +1440,43 @@ class Runner:
         base = read_config(base_path)
         cfg = derive_config(base, self.s, bool_flags=tune_knobs.BOOL_FLAGS,
                             log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base))
+        if self.s.gpus and not self.s.gpu_roles:             # a DeepSeek model on AMD keeps the card the person names from now on (strata_control/gpu_pick.py)
+            from strata_control import gpu_pick
+            gpu_pick.remember(base_path, [int(g) for g in self.s.gpus])
+        self.apply_four_card(cfg)
         self.use_own_dsv41_engine(cfg)
+        apply_experts(cfg, self.experts_flag(cfg.get("exe")))   # after the engine is settled: only a 0.1.50+ engine is given --experts
+        wait = self.start_wait()
+        if wait > 600 and not cfg.get("engine_ready_s"):     # the server's own wait for the engine (900 s) must not end before the start's
+            cfg["engine_ready_s"] = wait + 60
         out = launch_dir() / f"{self.name}.json"
         write_private(out, cfg)
         self.config_path = out
         return out
 
+    def apply_four_card(self, cfg: dict) -> None:
+        """Four Radeon AI PRO R9700 cards and Qwen3.8-Flash-Next IQ3_S: the measured serving profile (strata_control/amd_four_card.py), filled
+        in where the person chose nothing. Never stops a launch."""
+        self.four_card_parallel = None
+        try:
+            from strata_control import amd_four_card
+            picked = cfg.get("gpu")
+            if not (isinstance(picked, list) and len(picked) == amd_four_card.CARDS):
+                return
+            want = {int(i) for i in picked}
+            cards = [c for c in self.catalog.computer().usable_gpus if int(c.get("index", -1)) in want]
+            before = cfg.get("parallel")
+            notes = amd_four_card.apply(cards, cfg, parallel_given=bool(self.s.parallel))
+            if notes:
+                self.four_card_parallel = cfg.get("parallel") if before is None and cfg.get("parallel") else None   # (only a number the profile set)
+                self.emit("model", "Four " + str(cards[0].get("name", "AMD")).replace("AMD Radeon ", "") + " cards: " + "; ".join(notes) + ".", None)
+        except Exception:                                    # noqa: BLE001 - a profile is never a reason to stop a launch
+            self.four_card_parallel = None
+
     def ensure_profile(self, config: Path) -> None:
         from strata_control import profiles
         name = self.profile
-        parallel = self.s.parallel if self.s.parallel else self.catalog_parallel()
+        parallel = self.s.parallel if self.s.parallel else (getattr(self, "four_card_parallel", None) or self.catalog_parallel())
         sets = [f"host={acc.host_for(self.s.access)}", f"port={int(self.s.port)}"] + ([f"parallel={parallel}"] if parallel else [])
         try:
             current, _rev = profiles.load(name)
@@ -1334,12 +1564,12 @@ class Runner:
             if s.tuned_preset:
                 try:
                     presets.find(s.tuned_preset)
-                    self.emit("tune", "This preset is already tuned for this computer.", 100)
+                    self.emit("tune", "This preset is already tuned for this computer. Add --retune to measure again.", 100)
                     return
                 except presets.PresetError:
                     pass
             elif s.tuned_at:                                 # measured before: the standard settings were already the fastest, nothing was saved
-                self.emit("tune", f"Already tuned on {s.tuned_at}: this computer runs best with the standard settings. Nothing to do.", 100)
+                self.emit("tune", f"Already tuned on {s.tuned_at}: this computer runs best with the standard settings. Nothing to do; add --retune to measure again.", 100)
                 return
             stored = self.stored_tuning()
             if stored:                                       # the same model and choices were tuned on this computer before (a run by flags, no preset)
@@ -1577,7 +1807,7 @@ class Runner:
 
         def go() -> None:
             try:
-                box["r"] = runtime.start(name, wait=600)
+                box["r"] = runtime.start(name, wait=self.start_wait())
             except Exception as e:                           # noqa: BLE001
                 box["e"] = e
             finally:
@@ -1595,7 +1825,7 @@ class Runner:
             self.emit("start", f"Loading the model… {int(time.monotonic() - t0)} s", None)
         if "e" in box:
             self.end_failed_start()
-            raise LaunchError(f"The server could not start: {box['e']}", _log_hint(self.config_path), 6)
+            raise LaunchError(f"The server could not start: {box['e']}", _log_hint(self.config_path, box["e"]), 6)
         r = box["r"]
         if not r.get("ok"):
             text, nxt = explain_engine_exit(r, self.config_path, marks=self._marks, server_log=self.server_log_path())
@@ -1843,15 +2073,59 @@ class Runner:
         model = {"title": title, "family": s.family, "model": s.model, "model_gb": row.download_gb if row is not None else None,
                  "own_files": bool(s.model_path), "folder": s.model_path}
         out = {"profile": self.profile, "settings": s.to_dict(with_key=False), "warnings": warns,
-               "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download, "drafting": self.drafting_plan_line()}
+               "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download, "drafting": self.drafting_plan_line(),
+               "speed": self.speed_line()}
         if self.multi_file():
             out["placement"] = self.placement()
         return out
+
+    def resolved_speed(self) -> tuple[str, bool] | None:
+        """DeepSeek's speed: ("faster" | "full", whether it is the default for this PC); None for any other model. The default is the engine's own
+        rule (`--experts auto`: 5 when the cards used total 16 GiB or less); only an explicit choice is written as --experts."""
+        if not self.multi_file() or not self.speed_engine_ok():
+            return None
+        try:
+            default = faster_by_default(self.catalog.computer(), self.s)
+        except Exception:                                    # noqa: BLE001 - when the cards cannot be read, the engine's own default stands
+            default = False
+        if self.s.speed in S.SPEED_MODES:
+            return self.s.speed, (self.s.speed == "faster") == default
+        return ("faster" if default else "full"), True
+
+    def speed_engine_ok(self, exe=None) -> bool:
+        """The DeepSeek engine this launch will run takes --experts (0.1.50 or newer; the self-upgrade normally brings it first, but nothing relies
+        on that). `exe`: the engine a config names; else the one launch finds. No engine yet, or an older one: False, and the Speed choice stays out."""
+        if exe is None:
+            try:
+                exe = self.dsv41_engine_found()[0]
+            except Exception:                                # noqa: BLE001
+                exe = None
+        return engine_takes_experts(exe)
+
+    def experts_flag(self, exe=None) -> int | None:
+        """The engine's --experts for this launch: 5 or 6 only when the person chose and the engine takes it; None (nothing is passed, the engine's
+        `--experts auto` decides) when they did not, for an engine that is too old, and for a model that has no such choice."""
+        if not self.multi_file() or self.s.speed not in S.SPEED_MODES or not self.speed_engine_ok(exe):
+            return None
+        return 5 if self.s.speed == "faster" else 6
+
+    def speed_line(self, engine_experts: int | None = None) -> str:
+        """The speed line of --plan and of the summary, in plain words, with the quality note when it is Faster. `engine_experts`: what the
+        running engine said at its start ("experts per word: N"); it wins over the rule above, so the words are always the engine's."""
+        speed = self.resolved_speed()
+        if speed is None:
+            return ""
+        if engine_experts is not None and not self.s.speed:
+            speed = ("faster" if engine_experts < 6 else "full", True)
+        text = "Speed: " + S.speed_words(speed[0], speed[1])
+        return text + (". " + S.FASTER_NOTE if speed[0] == "faster" else "")
 
     def drafting_plan_line(self) -> str:
         """The drafting line of --plan: what drafts, or why not what was asked for. Nothing is changed or downloaded."""
         from strata_control import drafting
         if self.multi_file():                                # DeepSeek drafts with its own DSpark drafter (the --dspark auto the config writes), not MTP
+            if sys.platform == "darwin":
+                return "Drafting: off (DeepSeek's drafter was not faster on a Mac)"
             return "Drafting: DSpark (used when it speeds up answers on this computer)"
         try:
             base, cfg = self.installed_state()
@@ -1891,7 +2165,8 @@ class Runner:
             if old:
                 self.notices.append("DeepSeek runs on this install's own engine package, not the one the model's earlier settings named.")
         libs = [d for d in (cfg.get("lib_dirs") or []) if "engine-dsv41" not in str(d)]
-        cfg["lib_dirs"] = [*libs, str(Path(found).parent)]          # its own folder carries the libraries it needs
+        from strata_control import dsv41_engine
+        cfg["lib_dirs"] = [*libs, *dsv41_engine.lib_dirs(found)]     # its own folder, and rocm/bin for a Windows HIP package
 
     def upgrade_dsv41_engine(self, found: Path) -> Path:
         """The installed DeepSeek engine package is older than the signed feed's: fetch, check and start the newer one next to it and switch to it
@@ -2075,6 +2350,9 @@ HSA_START = re.compile(r"hsa_exception|HSA_STATUS_ERROR", re.I)
 HSA_START_NEXT = ("The graphics card was not ready yet; wait a few seconds and run it again. If it keeps happening, restart the PC "
                   "and report the log.")
 KNOWN_CAUSES = (
+    (re.compile(r"cannot run the expert kernel|needs AVX-?512", re.I),
+     "This model folder holds the pack for CPUs with AVX-512, and this PC's CPU does not have it. Run `strata setup` again: on a CPU "
+     "without AVX-512 it builds the pack that runs on AVX2 CPUs (Ryzen 3000-5000, Intel Core 12th-14th generation)."),
     (re.compile(r"no device of requested type|device not found|no (gpu|sycl|level.zero) device|permission denied.*(dri|render)", re.I),
      "The engine could not open the graphics card. On Linux the account must be allowed to use it: add it to the render group "
      "(`sudo usermod -aG render $USER`), log in again and start it again."),
@@ -2165,14 +2443,35 @@ def explain_engine_exit(result: dict, config: Path | None, marks: dict | None = 
     if not text.endswith((".", "!")):
         text += "."
     step = HSA_START_NEXT if hsa else next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log.")
-    return text, step + (f" The engine's log: {log}" if log else " The engine's log has the reason (strata logs, or the log named in the run config).")
+    return text, step + _log_sentence(log)
 
 
-def _log_hint(config: Path | None) -> str:
+def _log_sentence(log: str | None) -> str:
+    """The sentence that points at the engine's log. A log that does not exist is not pointed at: a start that stopped before the engine
+    existed (a profile whose runtime is still live, a missing engine package) never wrote one (#3714)."""
+    if log and os.path.isfile(log):
+        return f" The engine's log: {log}"
+    if log:
+        return " The engine did not get as far as writing its log, so the reason is in the lines above (`strata logs` has the server's own)."
+    return " The engine's log has the reason (strata logs, or the log named in the run config)."
+
+
+#: what the runtime says when another host still owns the profile: the start never began, so there is no engine log to read.
+PROFILE_BUSY = re.compile(r"already has a live managed runtime", re.I)
+
+
+def _log_hint(config: Path | None, error: object = None) -> str:
+    if PROFILE_BUSY.search(str(error or "")):
+        return ("Another Strata server for this preset is still running or starting, so this start never began and there is no engine log for it. "
+                "Run the command again; if it repeats, `strata launch --stop` ends the other server first.")
     log = None
     if config:
         try:
             log = read_config(config).get("log")
         except (OSError, ValueError):
             log = None
-    return f"The engine's log has the reason: {log}" if log else "The engine's log has the reason (strata logs, or the log named in the run config)."
+    if log and os.path.isfile(log):
+        return f"The engine's log has the reason: {log}"
+    if log:
+        return "The engine did not get as far as writing its log, so the reason is the message above (`strata logs` has the server's own)."
+    return "The engine's log has the reason (strata logs, or the log named in the run config)."
