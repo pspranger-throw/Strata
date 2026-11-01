@@ -221,14 +221,76 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     std::fclose(idx);
 
     if (pool == 0 || rows.empty()) { err = "index.txt has no header or no rows"; return false; }
+
+    // C6 (44/45): an exl3-native pack carries its dense linears as regions of dense.bin named by the
+    // exl3_dense.txt sidecar, deliberately NOT by index.txt rows (the pack header's own rule).  Synthesize a
+    // metadata row per sidecar tensor so lookups find them; they are force-skipped below (no canonical
+    // bytes exist to stage) and the exl3 provider attaches the device views after load.
+    const size_t exl3_rows0 = rows.size();
+    if (std::FILE* sc = std::fopen((pack_dir + "/exl3_dense.txt").c_str(), "rb")) {
+        char sline[1024];
+        int declared = -1;
+        std::vector<std::pair<uint64_t, uint64_t>> spans;
+        while (std::fgets(sline, sizeof sline, sc)) {
+            if (sline[0] == '#') {
+                int t = 0;
+                if (std::sscanf(sline, "# tensors %d", &t) == 1) declared = t;
+                continue;
+            }
+            char nm[256] = {0};
+            long long ne0 = 0, ne1 = 0, mul1 = 0;
+            int K = 0, cb = 0;
+            unsigned long long t_off = 0, suh_off = 0, svh_off = 0;
+            if (std::sscanf(sline, "%255s %lld %lld %d %d %llu %llu %llu %lld",
+                            nm, &ne0, &ne1, &K, &cb, &t_off, &suh_off, &svh_off, &mul1) != 9) {
+                err = std::string("exl3_dense.txt: could not parse a line (") + nm + ")";
+                std::fclose(sc);
+                return false;
+            }
+            const long long trellis = (ne0 / 16) * (ne1 / 16) * 32ll * K;   // the pack's own algebra (44 §b2a4fb04)
+            const long long span = trellis + 2ll * ne0 + 2ll * ne1;         // [trellis | suh per in | svh per out]
+            if (K < 1 || K > 8 || cb != 2 || ne0 <= 0 || ne1 <= 0 || ne0 % 128 != 0 || ne1 % 128 != 0 ||
+                suh_off != (long long) t_off + trellis || svh_off != (long long) suh_off + 2ll * ne0 ||
+                t_off % 64 != 0 || span <= 0) {
+                err = "exl3_dense.txt: region for " + std::string(nm) + " does not match the exl3 geometry contract";
+                std::fclose(sc);
+                return false;
+            }
+            IndexRow r;
+            r.name = nm;
+            r.file = 0;                                        // dense.bin (file_name kind 0)
+            r.kind = WeightKind::Exl3;
+            r.src_off = t_off;
+            r.src_bytes = (uint64_t) span;
+            r.dst_bytes = (uint64_t) span;
+            r.ne0 = ne0;
+            r.ne1 = ne1;
+            rows.push_back(r);
+            spans.emplace_back(t_off, (uint64_t) span);
+        }
+        std::fclose(sc);
+        if (declared >= 0 && (long long)(rows.size() - exl3_rows0) != declared) {
+            err = "exl3_dense.txt: header declares " + std::to_string(declared) + " tensors, found " +
+                  std::to_string(rows.size() - exl3_rows0);
+            return false;
+        }
+        std::sort(spans.begin(), spans.end());
+        for (size_t i = 1; i < spans.size(); ++i)
+            if (spans[i - 1].first + spans[i - 1].second > spans[i].first) {
+                err = "exl3_dense.txt: two sidecar regions overlap";
+                return false;
+            }
+    }
+
     // Plan v0.3 P1: a skip set compacts the arena.  Kept rows are re-placed in index order at the index's
     // alignment; skipped rows keep their metadata and get no bytes.
     std::vector<bool> skipped(rows.size(), false);
-    if (skip != nullptr) {
+    for (size_t i = exl3_rows0; i < rows.size(); ++i) skipped[i] = true;   // exl3 rows: skipped always
+    if (skip != nullptr || exl3_rows0 != rows.size()) {
         const uint64_t a = align > 0 ? (uint64_t) align : 256;
         uint64_t at = 0;
         for (size_t i = 0; i < rows.size(); ++i) {
-            if (skip->count(rows[i].name)) { skipped[i] = true; continue; }
+            if (skipped[i] || (skip != nullptr && skip->count(rows[i].name))) { skipped[i] = true; continue; }
             rows[i].dst_off = at;
             at += (rows[i].dst_bytes + a - 1) / a * a;
         }

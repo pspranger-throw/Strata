@@ -43,6 +43,8 @@ enum class WeightKind : int {
     Bf16InF32 = 1,  ///< the pack holds the bf16 value promoted to f32: take the HIGH 16 BITS (exact)
     F32 = 2,        ///< copy 4 bytes per element
     F16InF32 = 3,   ///< an f16 value promoted to f32: a real f32->f16 conversion, not a truncation
+    Exl3 = 6,       ///< an exl3 (44/45) dense linear: no canonical bytes - the metadata row exists so the
+                    ///< exl3 provider can attach its device views (index kinds 4/5 are raw16 aliases, never a kind)
 };
 
 struct WeightRef {
@@ -150,6 +152,7 @@ public:
 
 private:
     friend class NativeDense;
+    friend class Exl3Dense;
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
     std::string pack_dir_;

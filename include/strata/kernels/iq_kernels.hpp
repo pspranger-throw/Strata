@@ -47,9 +47,17 @@ void iq_dequant_gu_f16_exl3(int K, const void* gate, const void* up, int64_t n_f
                             uint16_t* dst, void* stream);
 void iq_dequant_f16_exl3(int K, const void* down, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream);
 
+/// C6 (45): one exl3 (200) DENSE linear's descriptor.  A WeightRef of native_type 200 carries a
+/// Exl3DenseDesc* in native_data (core owns the storage, the exl3 provider; the kernels layer builds
+/// the vendored Mat from it).  `base` is the DEVICE region [trellis | suh (2 B / input) | svh (2 B /
+/// output)] uploaded from dense.bin; k = inputs (ne0), n = outputs (ne1); cb 2 (mul1) throughout.
+struct Exl3DenseDesc {
+    const void* base = nullptr;
+    int k = 0, n = 0, K = 0, cb = 2;
+};
+
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
-struct NativeExpertLayout {
-    int gu_type = -1, d_type = -1;
+struct NativeExpertLayout {    int gu_type = -1, d_type = -1;
     int64_t n_embd = 0, n_ff = 0;
     int K = 0;                          // exl3 (200) only: the trellis width of all three roles; 0 for the rest
     size_t gu_row = 0, d_row = 0;       // bytes per row
