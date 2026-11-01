@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import re
 import struct
 
 import numpy as np
@@ -189,34 +190,145 @@ def main() -> int:
                 break
         else:
             groups.setdefault(k, {})
+    # ---- 46 canonical-vocab re-derivation (independent copy of the layout rules) ----
+    BF16, F32, F16, EXL3 = "BF16", "F32", "F16", "exl3"
+    L46 = {
+        "attn_hyper_connection.input_mix_weight_down.weight": ("hc_attn_down.weight", BF16),
+        "attn_hyper_connection.input_mix_weight_up.weight": ("hc_attn_up.weight", BF16),
+        "attn_hyper_connection.block_inject_weight.weight": ("hc_attn_inject.weight", BF16),
+        "attn_hyper_connection.hc_norm.weight": ("hc_attn_norm.weight", F32),
+        "mlp_hyper_connection.input_mix_weight_down.weight": ("hc_ffn_down.weight", BF16),
+        "mlp_hyper_connection.input_mix_weight_up.weight": ("hc_ffn_up.weight", BF16),
+        "mlp_hyper_connection.block_inject_weight.weight": ("hc_ffn_inject.weight", BF16),
+        "mlp_hyper_connection.hc_norm.weight": ("hc_ffn_norm.weight", F32),
+        "mlp.gate.weight": ("ffn_gate_inp.weight", BF16),
+        "mlp.shared_expert_gate.weight": ("ffn_gate_inp_shexp.weight", BF16),
+        "mlp.shared_expert.gate_proj": ("ffn_gate_shexp.weight", EXL3),
+        "mlp.shared_expert.up_proj": ("ffn_up_shexp.weight", EXL3),
+        "mlp.shared_expert.down_proj": ("ffn_down_shexp.weight", EXL3),
+        "linear_attn.in_proj_qkv": ("attn_qkv.weight", EXL3),
+        "linear_attn.in_proj_z": ("attn_gate.weight", EXL3),
+        "linear_attn.out_proj": ("ssm_out.weight", EXL3),
+        "linear_attn.in_proj_a.weight": ("ssm_alpha.weight", BF16),
+        "linear_attn.in_proj_b.weight": ("ssm_beta.weight", BF16),
+        "linear_attn.A_log": ("ssm_a", F32), "linear_attn.dt_bias": ("ssm_dt.bias", F32),
+        "linear_attn.norm.weight": ("ssm_norm.weight", F32),
+        "linear_attn.conv1d.weight": ("ssm_conv1d.weight", F32),
+        "self_attn.q_proj": ("attn_q.weight", EXL3), "self_attn.k_proj": ("attn_k.weight", EXL3),
+        "self_attn.v_proj": ("attn_v.weight", EXL3), "self_attn.o_proj": ("attn_output.weight", EXL3),
+        "self_attn.q_norm.weight": ("attn_q_norm.weight", F32),
+        "self_attn.k_norm.weight": ("attn_k_norm.weight", F32),
+        "self_attn.indexer.q_layernorm.weight": ("indexer.q_norm.weight", F32),
+        "self_attn.indexer.k_layernorm.weight": ("indexer.k_norm.weight", F32),
+        "self_attn.indexer.index_qk_proj": ("__split__", EXL3),
+        "ple.key_proj.weight": ("ple_key.weight", BF16),
+        "ple.value_proj.weight": ("ple_value.weight", BF16),
+        "ple.norm_key.weight": ("ple_norm_key.weight", F32),
+        "ple.norm_query.weight": ("ple_norm_query.weight", F32),
+        "ple.norm_conv.weight": ("ple_norm_conv.weight", F32),
+        "ple.conv1d.weight": ("ple_conv1d.weight", F16),
+    }
+
+    def canon46(key: str) -> tuple[str, str]:
+        if key == "model.language_model.embed_tokens.weight":
+            return "token_embd.weight", "shape"
+        if key == "lm_head":
+            return "output.weight", EXL3
+        if key == "model.language_model.hyper_connection_mixer.hc_norm.weight":
+            return "output_hc_norm.weight", F32
+        if key == "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight":
+            return "output_hc_down.weight", BF16
+        if key == "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight":
+            return "output_hc_up.weight", BF16
+        m = re.fullmatch(r"model\.language_model\.layers\.(\d+)\.(.+)", key)
+        if m and m.group(2) in L46:
+            hit = L46[m.group(2)]
+            if hit[0] == "__split__":
+                return f"blk.{m.group(1)}.indexer", "exl3-split"
+            return f"blk.{m.group(1)}.{hit[0]}", hit[1]
+        raise KeyError(f"46 verifier: no canonical name for {key}")
+
+    def conv46(b: bytes, src_dt: str, form: str) -> bytes:
+        if form == src_dt:
+            return b
+        if form == F32 and src_dt == "BF16":
+            return (np.frombuffer(b, "<u2").astype("<u4") << 16).view("<f4").tobytes()
+        if form == F32 and src_dt == "F16":
+            return np.frombuffer(b, "<f2").astype("<f4").tobytes()
+        if form == BF16 and src_dt == "F16":
+            u = np.frombuffer(b, "<f2").astype("<f4").view("<u4")
+            return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype("<u2").tobytes()
+        if form in (F16,) and src_dt in ("BF16", "F32"):
+            src = (np.frombuffer(b, "<u2").astype("<u4") << 16).view("<f4") if src_dt == "BF16" \
+                else np.frombuffer(b, "<f4")
+            return src.astype("<f2").tobytes()
+        raise AssertionError(f"46 verifier: {src_dt} -> {form}")
+
     dlines = [l.split() for l in (pack / "exl3_dense.txt").read_text().splitlines()
               if l and not l.startswith("#")]
-    check(len(dlines) == sum(1 for p_ in groups.values() if p_),
-          f"exl3_dense rows == source linear groups ({len(dlines)})")
+    dsider = {f_[0]: f_ for f_ in dlines}
+    check(len(dlines) == sum(1 for p_ in groups.values() if p_) - 12 + 24,
+          f"exl3_dense rows == source groups - 12 fused + 24 split ({len(dlines)})")
     n_bad = 0
     with open(pack / "dense.bin", "rb") as df:
-        def region(off_: int, key: str) -> bytes:
+        def at(off_: int, n_: int) -> bytes:
             df.seek(int(off_))
-            b = df.read(raw.size(key))
-            return b
-        for f_ in dlines:
-            name, to, so, vo = f_[0], f_[5], f_[6], f_[7]
-            for part, off_ in (("trellis", to), ("suh", so), ("svh", vo)):
-                if region(off_, name + "." + part) != raw[name + "." + part]:
-                    n_bad += 1
-            if int(f_[8]) != struct.unpack("<i", raw[name + ".mul1"])[0]:
+            return df.read(n_)
+        for base, parts in groups.items():
+            cname, form = canon46(base)
+            if not parts:
+                continue
+            if form == "exl3-split":
+                for suffix, t0, t1, o0, o1 in (("q_proj.weight", 0, 32, 0, 512),
+                                               ("k_proj.weight", 32, 40, 512, 640)):
+                    f2 = dsider.get(f"{cname}.{suffix}")
+                    if f2 is None:
+                        n_bad += 1
+                        continue
+                    ki = int(f2[1]) // 16
+                    tr = np.frombuffer(raw[parts["trellis"]], "<u4").reshape(ki, 40, -1)
+                    if at(f2[5], tr[:, t0:t1, :].nbytes) != tr[:, t0:t1, :].tobytes():
+                        n_bad += 1
+                    if at(f2[6], len(raw[parts["suh"]])) != raw[parts["suh"]]:
+                        n_bad += 1
+                    if at(f2[7], 2 * (o1 - o0)) != raw[parts["svh"]][2 * o0:2 * o1]:
+                        n_bad += 1
+                    if int(f2[8]) != struct.unpack("<i", raw[parts["mul1"]])[0]:
+                        n_bad += 1
+                continue
+            f2 = dsider.get(cname)
+            if f2 is None:
                 n_bad += 1
-    check(n_bad == 0, f"exl3_dense every region ({n_bad} bad fields)")
+                continue
+            for part, col in (("trellis", 5), ("suh", 6), ("svh", 7)):
+                if at(f2[col], len(raw[parts[part]])) != raw[parts[part]]:
+                    n_bad += 1
+            if int(f2[8]) != struct.unpack("<i", raw[parts["mul1"]])[0]:
+                n_bad += 1
+    check(n_bad == 0, f"exl3_dense every region incl split ({n_bad} bad fields)")
     ilines = [l.split() for l in (pack / "index.txt").read_text().splitlines()
               if l and not l.startswith("#")]
+    isider = {f_[0]: f_ for f_ in ilines}
     n_bad = 0
     with open(pack / "dense.bin", "rb") as df:
-        for f_ in ilines:
-            name, off_, nb = f_[0], int(f_[3]), int(f_[4])
-            df.seek(off_)
-            if df.read(nb) != raw[name]:
+        for base, parts in groups.items():
+            if parts:
+                continue
+            cname, form = canon46(base)
+            f2 = isider.get(cname)
+            if f2 is None:
                 n_bad += 1
-    check(n_bad == 0, f"index rows every byte ({n_bad} bad)")
+                continue
+            if form == "shape":
+                if f2[10] != "8":
+                    n_bad += 1
+                continue
+            want = conv46(raw[base], raw.tmap[base][0], form)
+            df.seek(int(f2[3]))
+            got = df.read(len(want))
+            if got != want:
+                n_bad += 1
+    check(n_bad == 0, f"index rows every byte incl form conversion ({n_bad} bad)")
     check(len(ilines) == sum(1 for p_ in groups.values() if not p_),
           f"index rows == source plain tensors ({len(ilines)})")
 
