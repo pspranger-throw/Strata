@@ -170,8 +170,45 @@ bool iq256_supported(int type) noexcept {
 
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
 
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, int K) {
     init_once();
+    // exl3 (format id 200 = kExl3Fmt, reserved by dsv41/exl3.hpp's kTypeEXL3): not a ggml type and not a trellis
+    // (Gyro) type - the geometry is the exl3 format itself.  A blob is three roles back to back, each role its
+    // trellis planes + suh + svh verbatim as the safetensors carried them (tools/exl3/pack_exl3.py): a trellis
+    // tile is 16x16 weights at K bits, so a role's trellis is (k/16)(n/16)*32*K bytes, its heads (k+n)*2 (suh one
+    // F16 per input, svh one per output).  The blob ends in the 16 B tail {mul1_gate, mul1_up, mul1_down, 0}.
+    // K is the pack's, uniform over the three roles (enforced at pack time; the vendored kernels refuse a gate K
+    // != up K).  The kernels take q8_1 activations; the blob is planes, not quant rows, so gu_row/d_row stay 0.
+    if (gu_type == kExl3Fmt || d_type == kExl3Fmt) {
+        if (gu_type != d_type) {
+            err = "native experts: exl3 packs carry " + std::to_string(kExl3Fmt) + " for both gate/up and down, got " +
+                  std::to_string(gu_type) + "/" + std::to_string(d_type);
+            return false;
+        }
+        if (K < 1 || K > 8) {
+            err = "native experts: exl3 K must be 1..8, got " + std::to_string(K);
+            return false;
+        }
+        if (n_embd % 16 != 0 || n_ff % 16 != 0) {
+            err = "native experts: exl3 needs n_embd and n_ff multiples of 16 (trellis tiles), got " +
+                  std::to_string(n_embd) + "/" + std::to_string(n_ff);
+            return false;
+        }
+        f = NativeFmt{};
+        f.gu_type = f.d_type = kExl3Fmt;
+        f.gu_act = f.d_act = GGML_TYPE_Q8_1;
+        f.n_embd = n_embd;
+        f.n_ff = n_ff;
+        f.K = K;
+        const uint64_t tile = (uint64_t) (n_embd / 16) * (uint64_t) (n_ff / 16) * 32ull * (uint64_t) K;
+        const uint64_t head = (uint64_t) (n_embd + n_ff) * 2ull;
+        f.up_off = (size_t) (tile + head);
+        f.down_off = (size_t) (2 * (tile + head));
+        f.bytes = (size_t) (3 * (tile + head) + 16);
+        f.act_bytes = (size_t) ggml_row_size(GGML_TYPE_Q8_1, (int) n_embd);
+        f.h_bytes = (size_t) ggml_row_size(GGML_TYPE_Q8_1, (int) n_ff);
+        return true;
+    }
     // The trellis types (Gyro, ggml types 144-146) are not in a ggml built from upstream (and an upstream ggml indexes its
     // type table by the id, so asking it about 144 reads past the table): their geometry and activation format (Q8_0)
     // are known here, and their rows run on tq_cpu.hpp.

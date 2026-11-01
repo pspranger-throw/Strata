@@ -484,13 +484,27 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        // v6 exl3 lines carry the trellis K as a 6th column, and no GGUF-offset columns follow (an exl3 expert
+        // is never inside a GGUF shard).  A 200 line in a pre-v6 table has no K to read: refused, never guessed.
+        long long K = 0;
+        if (gt == kExl3Fmt || dt == kExl3Fmt) {
+            if (L.version != 6) {
+                err = "native_experts.txt v" + std::to_string(L.version) + " carries exl3 (" +
+                      std::to_string(kExl3Fmt) + ") lines: only v6 writes the trellis K column";
+                return false;
+            }
+            if (!(ss >> K)) {
+                err = "native_experts.txt: layer " + std::to_string(l) + ": exl3 line without its K: " + line;
+                return false;
+            }
+        }
+        if (!native_fmt((int) gt, (int) dt, H, FF, f, err, (int) K)) return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
             return false;
         }
-        if (ss >> go >> uo >> dox) {   // v2 lines: the GGUF offsets
+        if (gt != kExl3Fmt && (ss >> go >> uo >> dox)) {   // v2 lines: the GGUF offsets
             if (L.gguf_off.empty()) L.gguf_off.assign((size_t) (3 * n_layers), 0);
             L.gguf_off[(size_t) (3 * l)] = go;
             L.gguf_off[(size_t) (3 * l + 1)] = uo;
@@ -541,7 +555,9 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     {
         std::ifstream probe(pack_dir + "/hadamard.txt");
         const bool have = (bool) probe;
-        if (L.version >= 5 && !have) {
+        // v5 is defined by hadamard.txt, so a v5 pack without it is inconsistent.  v6 is defined by the exl3 K
+        // column, not by rotation: a v6 pack need not carry hadamard.txt (a v6 pack that does still gets parsed).
+        if (L.version == 5 && !have) {
             err = "native_experts.txt v5 declares Hadamard-folded experts, but " + pack_dir + "/hadamard.txt is missing";
             return false;
         }

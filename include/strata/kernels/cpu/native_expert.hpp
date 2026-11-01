@@ -42,14 +42,21 @@ struct NativeFmt {
     int layer = -1;                     ///< the layer this format belongs to (set by expert_layout_load; STRATA_ACT_DUMP only)
     const float* gu_signs = nullptr;    ///< n_embd signs for x (nullptr: identity)
     const float* d_signs = nullptr;     ///< n_ff signs for h (nullptr: identity)
+    /// exl3 (format ids 200, kExl3Fmt) only: the trellis width K of this layer's blobs, uniform over the three
+    /// roles (enforced at pack time; the vendored kernels reject gate K != up K). 0 = not exl3.
+    int K = 0;
 };
 constexpr int kNvfp4Type = 40;
 constexpr size_t kNvfp4Tail = 16;
+/// The exl3 weight format id, mirroring dsv41/exl3.hpp's kTypeEXL3 (that header is CUDA-side; the CPU side reads
+/// the id from native_experts.txt v6 columns). Reserved by the format, never a ggml type.
+constexpr int kExl3Fmt = 200;
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+/// `K` is the exl3 (200) trellis width, ignored by every other format (native_experts.txt v6's 6th column).
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, int K = 0);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes), rotated first when the layer is Hadamard-folded.
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
