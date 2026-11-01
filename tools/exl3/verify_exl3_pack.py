@@ -286,7 +286,7 @@ def main() -> int:
                         n_bad += 1
                         continue
                     ki = int(f2[1]) // 16
-                    tr = np.frombuffer(raw[parts["trellis"]], "<u4").reshape(ki, 40, -1)
+                    tr = np.frombuffer(raw[parts["trellis"]], "<u2").reshape(ki, 40, -1)
                     if at(f2[5], tr[:, t0:t1, :].nbytes) != tr[:, t0:t1, :].tobytes():
                         n_bad += 1
                     if at(f2[6], len(raw[parts["suh"]])) != raw[parts["suh"]]:

@@ -374,7 +374,7 @@ def main() -> int:
                 # indexer.k_proj (128): trellis tile COLUMNS split 32+8 (each piece stands alone,
                 # ld = its own n/16); suh duplicated; svh split (46 §2.11).
                 assert ki * 16 == 2560 and nj * 16 == 640, f"{base}: indexer {ki}x{nj}"
-                tr = np.frombuffer(s.raw(parts["trellis"]), "<u4").reshape(ki, nj, words)
+                tr = np.frombuffer(s.raw(parts["trellis"]), "<u2").reshape(ki, nj, words)
                 suh, svh = s.raw(parts["suh"]), s.raw(parts["svh"])
                 assert len(suh) == 2 * ki * 16 and len(svh) == 2 * nj * 16
                 t = wr(tr[:, :32, :].tobytes()); sq = wr(suh); vq = wr(svh[:2 * 512])
