@@ -5534,7 +5534,8 @@ bool native_expert_grouped_exl3(const NativeExpertLayout& L, const unsigned long
 void native_expert_exl3_prepare(void* stream) {
     // the vendored Scratch (device, stream) refuses a stream FIRST SEEN inside graph capture
     // (exl3.cu:1243-1248) - verify captures its windows, so allocate the scratch before any capture
-    if (!ek::prepare((cudaStream_t) stream)) std::fprintf(stderr, "native_expert_exl3_prepare: scratch failed\n");
+    if (!strata::dsv41k::exl3::prepare((cudaStream_t) stream))
+        std::fprintf(stderr, "native_expert_exl3_prepare: scratch failed\n");
 }
 #else
 bool native_expert_grouped_exl3(const NativeExpertLayout&, const unsigned long long*, const int32_t*,
@@ -5547,7 +5548,7 @@ bool native_expert_grouped_exl3(const NativeExpertLayout&, const unsigned long l
 void native_expert_exl3_prepare(void*) {}
 #endif
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int K) {
     NativeExpertLayout L;
     L.gu_type = gu_type;
     L.d_type = d_type;
