@@ -4976,6 +4976,17 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     check("iq_dequant_gu_f16");
 }
 
+// exl3 (200) prompt dequant: the bridge is CUDA-only; sycl-generate's native_expert_supported gate already refuses
+// a 200 pack at boot (is_iq(200) false), so these are link integrity for the shared prefill.cpp, not a gate.
+void iq_dequant_gu_f16_exl3(int, const void*, const void*, int64_t, int64_t, uint16_t*, void*) {
+    std::fprintf(stderr, "iq_dequant_gu_f16_exl3: exl3 native experts are not built for this backend\n");
+    std::exit(1);
+}
+void iq_dequant_f16_exl3(int, const void*, int64_t, int64_t, uint16_t*, void*) {
+    std::fprintf(stderr, "iq_dequant_f16_exl3: exl3 native experts are not built for this backend\n");
+    std::exit(1);
+}
+
 // 0.1.43: gate/up and down of one expert in one launch.  Work-group g of the first 2 * n_ff * per_row is the gu kernel's
 // (row-superblock g / 2, parity g % 2); the rest are the flat kernel's superblocks of the down matrix.
 namespace {

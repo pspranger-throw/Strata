@@ -5537,6 +5537,66 @@ void native_expert_exl3_prepare(void* stream) {
     if (!strata::dsv41k::exl3::prepare((cudaStream_t) stream))
         std::fprintf(stderr, "native_expert_exl3_prepare: scratch failed\n");
 }
+
+// exl3 (200) prompt-path dequant (GLM R3.2, owner ratified): full reconstruct_rows into the prompt buffers -
+// the same dequant-then-FP16-GEMM story as every other quant's prompt path.  Blob regions are v6's: each role
+// [trellis | suh (2 B per INPUT) | svh (2 B per OUTPUT)], cb 2 (mul1) from the G0 census.  gate/up use the
+// reconstruct's ld_out patch to land in the interleaved layout iq_dequant_gu_f16 promises; down is contiguous.
+void iq_dequant_gu_f16_exl3(int K, const void* gate, const void* up, int64_t n_ff, int64_t n_embd,
+                            uint16_t* dst, void* stream) {
+    namespace ek = strata::dsv41k::exl3;
+    if (K < 1 || K > 8 || n_ff % 128 != 0 || n_embd % 128 != 0) {
+        std::fprintf(stderr, "iq_dequant_gu_f16_exl3: K %d / %lld x %lld\n", K, (long long) n_ff, (long long) n_embd);
+        std::exit(1);
+    }
+    const size_t tile = ek::trellis_bytes(n_embd, n_ff, K);
+    ek::Mat mg;
+    mg.trellis = (const uint32_t*) gate;
+    mg.suh = (const uint16_t*) ((const uint8_t*) gate + tile);
+    mg.svh = mg.suh + n_embd;
+    mg.k = (int) n_embd; mg.n = (int) n_ff; mg.K = K; mg.cb = 2;
+    ek::Mat mu;
+    mu.trellis = (const uint32_t*) up;
+    mu.suh = (const uint16_t*) ((const uint8_t*) up + tile);
+    mu.svh = mu.suh + n_embd;
+    mu.k = (int) n_embd; mu.n = (int) n_ff; mu.K = K; mu.cb = 2;
+    if (!ek::supported(mg) || !ek::supported(mu)) {
+        std::fprintf(stderr, "iq_dequant_gu_f16_exl3: the matrices are outside the vendored kernels\n");
+        std::exit(1);
+    }
+    const cudaStream_t s = (cudaStream_t) stream;
+    const int ld = (int) (2 * n_embd);   // row 2r = gate row r, row 2r+1 = up row r
+    const int le0 = ek::launch_errors();
+    ek::reconstruct_rows(mg, dst, false, s, ld);
+    ek::reconstruct_rows(mu, dst + n_embd, false, s, ld);
+    if (ek::launch_errors() != le0) {
+        std::fprintf(stderr, "iq_dequant_gu_f16_exl3: reconstruct fault (async IMA or bad matrix)\n");
+        std::exit(1);
+    }
+}
+void iq_dequant_f16_exl3(int K, const void* down, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream) {
+    namespace ek = strata::dsv41k::exl3;
+    if (K < 1 || K > 8 || n_ff % 128 != 0 || n_embd % 128 != 0) {
+        std::fprintf(stderr, "iq_dequant_f16_exl3: K %d / %lld x %lld\n", K, (long long) n_ff, (long long) n_embd);
+        std::exit(1);
+    }
+    const size_t tile = ek::trellis_bytes(n_ff, n_embd, K);
+    ek::Mat md;
+    md.trellis = (const uint32_t*) down;
+    md.suh = (const uint16_t*) ((const uint8_t*) down + tile);
+    md.svh = md.suh + n_ff;   // down: n_ff inputs, n_embd outputs
+    md.k = (int) n_ff; md.n = (int) n_embd; md.K = K; md.cb = 2;
+    if (!ek::supported(md)) {
+        std::fprintf(stderr, "iq_dequant_f16_exl3: the matrix is outside the vendored kernels\n");
+        std::exit(1);
+    }
+    const int le0 = ek::launch_errors();
+    ek::reconstruct_rows(md, dst, false, (cudaStream_t) stream, 0);
+    if (ek::launch_errors() != le0) {
+        std::fprintf(stderr, "iq_dequant_f16_exl3: reconstruct fault (async IMA or bad matrix)\n");
+        std::exit(1);
+    }
+}
 #else
 bool native_expert_grouped_exl3(const NativeExpertLayout&, const unsigned long long*, const int32_t*,
                                 const int32_t*, const int32_t*, int64_t, int, const float*, void*, float*, void*) {
@@ -5546,6 +5606,14 @@ bool native_expert_grouped_exl3(const NativeExpertLayout&, const unsigned long l
     return false;
 }
 void native_expert_exl3_prepare(void*) {}
+void iq_dequant_gu_f16_exl3(int, const void*, const void*, int64_t, int64_t, uint16_t*, void*) {
+    std::fprintf(stderr, "iq_dequant_gu_f16_exl3: this engine was built without STRATA_BUILD_DSV41\n");
+    std::exit(1);
+}
+void iq_dequant_f16_exl3(int, const void*, int64_t, int64_t, uint16_t*, void*) {
+    std::fprintf(stderr, "iq_dequant_f16_exl3: this engine was built without STRATA_BUILD_DSV41\n");
+    std::exit(1);
+}
 #endif
 
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int K) {

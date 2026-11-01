@@ -176,7 +176,9 @@ void set_down(const SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy,
 void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta, cudaStream_t s);
 
 /// The full weight in the engine's row layout: dst[r][c] = W[c][r] (n rows of k values), BF16 or F16 bits.
-void reconstruct_rows(const Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
+/// `ld_out` > 0 (strata patch, prompt path): the dst row stride - the qwen prompt path keeps gate and up
+/// interleaved (row 2r = gate row r), so the rows land ldo_out apart instead of k; 0 = contiguous (k), as before.
+void reconstruct_rows(const Mat& m, uint16_t* dst, bool bf16, cudaStream_t s, int ld_out = 0);
 /// The decoded W' alone in that layout: dst[c][r] = W'[r][c], F16 bits (exactly the decoded values) - for a product
 /// that rotates its activations and outputs instead of the weight (x W = H(H(x * suh) W') * svh): rows_rot_f16 before
 /// the GEMM, rows_rot_out after it.  No Hadamard over the k x n weight: a plain decode, at the memory's speed.

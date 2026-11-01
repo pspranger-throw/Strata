@@ -39,6 +39,13 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
 /// the up weights would sit near 1e-8, deep in FP16's subnormals).
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
                        void* stream, const float* tail = nullptr);
+/// exl3 (200) native blobs (bridge builds; native_experts.txt v6): the prompt path's dequant via the vendored
+/// full reconstruct (exl3::reconstruct_rows, mul1 codebook cb 2 - the G0 census).  gate/up land in the same
+/// interleaved fp16 layout as above (row 2r = gate row r, row stride 2 * n_embd: the reconstruct's ld_out
+/// patch); the down matrix is contiguous [n_embd rows of n_ff].  `K`: the layer's trellis width (v6 column).
+void iq_dequant_gu_f16_exl3(int K, const void* gate, const void* up, int64_t n_ff, int64_t n_embd,
+                            uint16_t* dst, void* stream);
+void iq_dequant_f16_exl3(int K, const void* down, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream);
 
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
 struct NativeExpertLayout {

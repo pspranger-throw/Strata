@@ -773,8 +773,8 @@ __global__ void win_wait_kernel(const unsigned* p, unsigned v) {
 template <int K, int cb>
 __global__ void __launch_bounds__(kThreads) recon_rows_kernel(const uint32_t* __restrict__ tr, int ld,
                                                               const uint16_t* __restrict__ suh,
-                                                              const uint16_t* __restrict__ svh, int k, uint16_t* dst,
-                                                              bool bf16) {
+                                                              const uint16_t* __restrict__ svh, int k, int ldo,
+                                                              uint16_t* dst, bool bf16) {
     constexpr int W = 8 * K;
     constexpr int P = kCols + 2;   // padded row (halves)
     __shared__ __half tile[kCols * P];
@@ -812,7 +812,7 @@ __global__ void __launch_bounds__(kThreads) recon_rows_kernel(const uint32_t* __
         for (int i = 0; i < 4; ++i) v[i] = __half2float(tile[(lane * 4 + i) * P + c]);
         had128(v, lane);
         const float sv = h2f(svh[nb * kCols + c]);
-        uint16_t* d = dst + (size_t) (nb * kCols + c) * k + kb * kCols + lane * 4;
+        uint16_t* d = dst + (size_t) (nb * kCols + c) * ldo + kb * kCols + lane * 4;   // ldo: the dst row stride (k contiguous)
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const float w = v[i] * sv * h2f(suh[kb * kCols + lane * 4 + i]);
@@ -1185,9 +1185,9 @@ template <int K, int cb> struct RunDown {
     }
 };
 template <int K, int cb> struct RunRows {
-    static void run(const Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
+    static void run(const Mat& m, uint16_t* dst, bool bf16, cudaStream_t s, int ldo) {
         strata_ds4_launch(recon_rows_kernel<K, cb>, dim3((unsigned) (m.n / kCols), (unsigned) (m.k / kCols)), kThreads, 0, s, 
-            m.trellis, m.ld > 0 ? m.ld : m.n / 16, m.suh, m.svh, m.k, dst, bf16);
+            m.trellis, m.ld > 0 ? m.ld : m.n / 16, m.suh, m.svh, m.k, ldo, dst, bf16);
     }
 };
 #if !defined(STRATA_USE_HIP)
@@ -1705,8 +1705,8 @@ void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, i
 #endif
 }
 
-void reconstruct_rows(const Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
-    if (!supported(m) || !dispatch<RunRows>(m.K, m.cb, m, dst, bf16, s)) {
+void reconstruct_rows(const Mat& m, uint16_t* dst, bool bf16, cudaStream_t s, int ld_out) {
+    if (!supported(m) || !dispatch<RunRows>(m.K, m.cb, m, dst, bf16, s, ld_out > 0 ? ld_out : m.k)) {
         std::fprintf(stderr, "exl3 reconstruct_rows: unsupported matrix\n");
         g_launch_errors.fetch_add(1, std::memory_order_relaxed);
         return;
