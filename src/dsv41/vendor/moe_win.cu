@@ -9,9 +9,9 @@
 
 namespace strata::dsv41k::glmf {
 namespace {
-constexpr int kWinEnt = kMaxWinTokens * 8;
+constexpr int kWinEnt = kMaxWinTokens * kMaxWinK;
 
-// the entries grouped by expert slot (in order of first appearance), each group's members in entry order (t * 8 + i)
+// the entries grouped by expert slot (in order of first appearance), each group's members in entry order (t * k + i)
 // (the tables in shared memory: as locals they were a 2.6 KB stack a thread, which the driver reserves for every thread
 // the device can hold - ~420 MB on a V100 - and a launch failed "out of memory" once the expert pool had the rest)
 __global__ void moe_win_group_kernel(const __grid_constant__ MoeWin w) {
@@ -20,8 +20,8 @@ __global__ void moe_win_group_kernel(const __grid_constant__ MoeWin w) {
     if (threadIdx.x != 0) return;
     int ng = 0;
     for (int t = 0; t < w.T; ++t)
-        for (int i = 0; i < 8; ++i) {
-            const int e = t * 8 + i;
+        for (int i = 0; i < w.k; ++i) {
+            const int e = t * w.k + i;
             gof[e] = -1;
             const unsigned long long p = i < w.k ? w.plan_ptr[e] : 0ull;
             if (p == 0ull) continue;
@@ -41,7 +41,7 @@ __global__ void moe_win_group_kernel(const __grid_constant__ MoeWin w) {
         fill[g + 1] = fill[g] + cnt[g];
     }
     w.grp_start[ng] = fill[ng];
-    for (int e = 0; e < w.T * 8; ++e)
+    for (int e = 0; e < w.T * w.k; ++e)
         if (gof[e] >= 0) w.grp_ent[fill[gof[e]]++] = e;
     *w.n_groups = ng;
 }

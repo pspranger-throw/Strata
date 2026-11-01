@@ -24,6 +24,7 @@
 #include <ds4_metal_host.h>
 #endif
 #include "strata/dsv41/exl3.hpp"
+#include "strata/dsv41/moe_win.hpp"   // kMaxWinK: the widest routing a window plan carries (the grouping shares it)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -54,6 +55,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s);
 #endif
 
 namespace strata::dsv41k::exl3 {
+constexpr int kMaxWinK = glmf::kMaxWinK;   // one constant with the grouping (moe_win.cu): plans stride by the runtime k
 namespace {
 
 constexpr int kThreads = 256, kWarps = 8;
@@ -654,7 +656,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_down_kernel(const KMoe a) {
     __threadfence();
     if (threadIdx.x < kCols) {
         const int r = g * kCols + threadIdx.x;
-        float p[8];
+        float p[kMaxWinK];
         for (int i = 0; i < a.k; ++i) p[i] = *(volatile const float*) &a.part[(size_t) i * a.n_embd + r];
         a.out[r] = combine(a.plan_w, p, a.k, a.cpu_flag != nullptr && *a.cpu_flag ? a.cpu_part + r : nullptr,
                            a.sh_out != nullptr ? a.sh_out[r] : 0.0f);
@@ -663,7 +665,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_down_kernel(const KMoe a) {
 }
 
 // ---------------------------------------------------------------- a verify window's routed experts
-// gf::moe_win_experts' grouping (group g: one expert, its blob at grp_ptr[g]; its entries e = t * 8 + i at
+// gf::moe_win_experts' grouping (group g: one expert, its blob at grp_ptr[g]; its entries e = t * k + i at
 // grp_ent[grp_start[g] ..)), each group's weights read and decoded once for up to kTok of its tokens at a time (as
 // exllamav3's fused MoE runs a run of slots that picked one expert as the rows of one MMA tile), with the token
 // path's arithmetic per entry: every token's output is moe_gate_up + moe_down's for it alone, bit for bit
@@ -677,9 +679,9 @@ struct KWin {
     const int* cpu_flag;
     const float* x;
     size_t x_stride;
-    float* h;            // [T * 8][n_ff]: the gate's values, then the swiglu
-    float* u;            // [T * 8][n_ff]: the up's values
-    float* part;         // [T * 8][n_embd]
+    float* h;            // [T * k][n_ff]: the gate's values, then the swiglu
+    float* u;            // [T * k][n_ff]: the up's values
+    float* part;         // [T * k][n_embd]
     const float* sh_out; // [T][n_embd]
     float* out;
     size_t out_stride;
@@ -704,7 +706,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) win_gu_kernel(const KWin a) {
     for (int mm = m0; mm < m1; mm += kTok) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
-        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
+        if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] / a.k) * a.x_stride;
         block_gemv<K, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
                           (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
@@ -745,13 +747,13 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) win_down_kernel(const KWin a) {
 // grid (n_embd / 128, T): each token's outputs, moe_down_kernel's combine (an entry off the device adds 0)
 __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
     const int t = blockIdx.y, r = blockIdx.x * kCols + threadIdx.x;
-    float p[8];
+    float p[kMaxWinK];
     for (int i = 0; i < a.k; ++i) {
-        const int e = t * 8 + i;
+        const int e = t * a.k + i;
         p[i] = a.plan_ptr[e] != 0ull ? a.part[(size_t) e * a.n_embd + r] : 0.0f;
     }
     a.out[(size_t) t * a.out_stride + r] =
-        combine(a.plan_w + t * 8, p, a.k,
+        combine(a.plan_w + t * a.k, p, a.k,
                 a.cpu_flag != nullptr && a.cpu_flag[t] ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
@@ -1491,7 +1493,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
 static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     Scratch* sc = scratch(s);
     if (sc == nullptr) return false;
-    if (a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||
+    if (a.k < 1 || a.k > kMaxWinK || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||
         a.n_ff > kMaxMoeK || (size_t) a.k * a.n_ff > kHFloats || (size_t) a.k * a.n_embd > kPartFloats ||
         (size_t) (a.n_embd / kCols) > kCntGU || kCntGU + (size_t) a.k * (a.n_ff / kCols) > kCounters) {
         std::fprintf(stderr, "exl3 moe: geometry not covered (k %d n_embd %d n_ff %d)\n", a.k, a.n_embd, a.n_ff);
@@ -1547,7 +1549,7 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
 
 bool win_experts(const WinArgs& a, cudaStream_t s) {
     EXL3_LEGACY(win_experts(a, s));
-    if (a.T < 1 || a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||
+    if (a.T < 1 || a.k < 1 || a.k > kMaxWinK || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||
         a.n_ff > kMaxMoeK || a.lay.K[0] != a.lay.K[1] || a.h == nullptr || a.part == nullptr || a.out == nullptr) {
         std::fprintf(stderr, "exl3 win_experts: not covered (T %d k %d n_embd %d n_ff %d, gate K %d up K %d)\n", a.T,
                      a.k, a.n_embd, a.n_ff, a.lay.K[0], a.lay.K[1]);
@@ -1556,7 +1558,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     Scratch* sc = scratch(s);
     if (sc == nullptr) return false;
     const int groups = a.T * a.k;   // at most (the blocks past the real count return at once)
-    if ((size_t) a.T * 8 * a.n_ff > kUFloats || kCntGU + (size_t) groups * (a.n_ff / kCols) > kCounters) {
+    if ((size_t) a.T * a.k * a.n_ff > kUFloats || kCntGU + (size_t) groups * (a.n_ff / kCols) > kCounters) {
         std::fprintf(stderr, "exl3 win_experts: %d tokens are more than the scratch takes\n", a.T);
         return false;
     }

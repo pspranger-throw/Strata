@@ -21,6 +21,7 @@
 #if !defined(STRATA_USE_HIP)   // (AMD runs exl3.cu's kernels; EXL3 does not run there anyway)
 #include "../ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "strata/dsv41/exl3.hpp"
+#include "strata/dsv41/moe_win.hpp"   // kMaxWinK, shared with the grouping and the new path
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -33,6 +34,7 @@
 #include <utility>
 
 namespace strata::dsv41k::exl3::legacy {
+constexpr int kMaxWinK = glmf::kMaxWinK;   // one width constant across both decode paths and the grouping
 namespace {
 
 constexpr int kThreads = 256, kWarps = 8;
@@ -539,7 +541,7 @@ __global__ void __launch_bounds__(kThreads) moe_down_kernel(const KMoe a) {
     __threadfence();
     if (threadIdx.x < kCols) {
         const int r = g * kCols + threadIdx.x;
-        float p[8];
+        float p[kMaxWinK];
         for (int i = 0; i < a.k; ++i) p[i] = *(volatile const float*) &a.part[(size_t) i * a.n_embd + r];
         a.out[r] = combine(a.plan_w, p, a.k, a.cpu_flag != nullptr && *a.cpu_flag ? a.cpu_part + r : nullptr,
                            a.sh_out != nullptr ? a.sh_out[r] : 0.0f);
@@ -548,7 +550,7 @@ __global__ void __launch_bounds__(kThreads) moe_down_kernel(const KMoe a) {
 }
 
 // ---------------------------------------------------------------- a verify window's routed experts
-// gf::moe_win_experts' grouping (group g: one expert, its blob at grp_ptr[g]; its entries e = t * 8 + i at
+// gf::moe_win_experts' grouping (group g: one expert, its blob at grp_ptr[g]; its entries e = t * k + i at
 // grp_ent[grp_start[g] ..)), each group's weights read and decoded once for up to kNC of its tokens at a time (as
 // exllamav3's fused MoE runs a run of slots that picked one expert as the rows of one MMA tile), with the token
 // path's arithmetic per entry: every token's output is moe_gate_up + moe_down's for it alone, bit for bit
@@ -561,8 +563,8 @@ struct KWin {
     const int* cpu_flag;
     const float* x;
     size_t x_stride;
-    float* h;            // [T * 8][n_ff]
-    float* part;         // [T * 8][n_embd]
+    float* h;            // [T * k][n_ff]
+    float* part;         // [T * k][n_embd]
     const float* sh_out; // [T][n_embd]
     float* out;
     size_t out_stride;
@@ -585,7 +587,7 @@ __global__ void __launch_bounds__(kThreads) win_gu_kernel(const KWin a) {
         const int nc = min(kNC, m1 - m0);
         for (int r = 0; r < 2; ++r) {
             for (int c = 0; c < nc; ++c)
-                rotate_in(a.x + (size_t) (a.grp_ent[m0 + c] >> 3) * a.x_stride, nullptr,
+                rotate_in(a.x + (size_t) (a.grp_ent[m0 + c] / a.k) * a.x_stride, nullptr,
                           (const uint16_t*) (blob + a.suh[r]), 0, a.n_embd, sm.xs + c * kMaxKR);
             __syncthreads();
             block_gemv_n<K, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd / 16, sm.xs, nc,
@@ -631,13 +633,13 @@ __global__ void __launch_bounds__(kThreads) win_down_kernel(const KWin a) {
 // grid (n_embd / 128, T): each token's outputs, moe_down_kernel's combine (an entry off the device adds 0)
 __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
     const int t = blockIdx.y, r = blockIdx.x * kCols + threadIdx.x;
-    float p[8];
+    float p[kMaxWinK];
     for (int i = 0; i < a.k; ++i) {
-        const int e = t * 8 + i;
+        const int e = t * a.k + i;
         p[i] = a.plan_ptr[e] != 0ull ? a.part[(size_t) e * a.n_embd + r] : 0.0f;
     }
     a.out[(size_t) t * a.out_stride + r] =
-        combine(a.plan_w + t * 8, p, a.k, a.cpu_flag[t] ? a.cpu_part + (size_t) t * a.n_embd + r : nullptr,
+        combine(a.plan_w + t * a.k, p, a.k, a.cpu_flag[t] ? a.cpu_part + (size_t) t * a.n_embd + r : nullptr,
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
 
@@ -873,7 +875,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
 static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     Scratch* sc = scratch(s);
     if (sc == nullptr) return false;
-    if (a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxKR ||
+    if (a.k < 1 || a.k > kMaxWinK || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxKR ||
         a.n_ff > kMaxKR || (size_t) a.k * a.n_ff > kHFloats || (size_t) a.k * a.n_embd > kPartFloats ||
         (size_t) (a.n_embd / kCols) > kCounters) {
         std::fprintf(stderr, "exl3 moe: geometry not covered (k %d n_embd %d n_ff %d)\n", a.k, a.n_embd, a.n_ff);
@@ -923,7 +925,7 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
 }
 
 bool win_experts(const WinArgs& a, cudaStream_t s) {
-    if (a.T < 1 || a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxKR ||
+    if (a.T < 1 || a.k < 1 || a.k > kMaxWinK || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxKR ||
         a.n_ff > kMaxKR || a.lay.K[0] != a.lay.K[1] || a.h == nullptr || a.part == nullptr || a.out == nullptr) {
         std::fprintf(stderr, "exl3 win_experts: not covered (T %d k %d n_embd %d n_ff %d, gate K %d up K %d)\n", a.T,
                      a.k, a.n_embd, a.n_ff, a.lay.K[0], a.lay.K[1]);

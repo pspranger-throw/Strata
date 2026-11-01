@@ -107,16 +107,16 @@ void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
 
 /// A verify window's routed experts, each distinct expert read once for all the tokens it serves (after exllamav3's
-/// fused MoE, which runs the slots that picked one expert as the rows of one tile): T tokens' plans [T][8] grouped by
-/// expert (glmf::moe_win_group: group g's blob at grp_ptr[g], its entries e = t * 8 + i at grp_ent[grp_start[g] ..
+/// fused MoE, which runs the slots that picked one expert as the rows of one tile): T tokens' plans [T][k] grouped by
+/// expert (glmf::moe_win_group: group g's blob at grp_ptr[g], its entries e = t * k + i at grp_ent[grp_start[g] ..
 /// grp_start[g + 1])), token t's F32 input at x + t x_stride, its output at out + t out_stride (plus the CPU lane's
 /// part when cpu_flag[t], plus sh_out's row t) - every token's output is moe_gate_up + moe_down's for it alone, bit for
 /// bit.  h [T * 8][n_ff] and part [T * 8][n_embd] are the caller's scratch.
 struct WinArgs {
     const unsigned long long* grp_ptr = nullptr;
     const int *grp_start = nullptr, *grp_ent = nullptr, *n_groups = nullptr;
-    const unsigned long long* plan_ptr = nullptr;   // [T][8]
-    const float* plan_w = nullptr;                  // [T][8]
+    const unsigned long long* plan_ptr = nullptr;   // [T][k] (k <= kMaxWinK, moe_win.hpp)
+    const float* plan_w = nullptr;                  // [T][k]
     const float* cpu_part = nullptr;                // [T][n_embd] (rows cpu_stride apart when given)
     size_t cpu_stride = 0;
     const int* cpu_flag = nullptr;                  // [T]

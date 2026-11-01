@@ -8,9 +8,13 @@
 
 namespace strata::dsv41k::glmf {
 constexpr int kMaxMvCols = 16;
+/// The widest routing a window's plan can carry.  8 is every shipped producer's width (DS4's top-8, the plan_w
+/// and grp tables' legacy stride); a wider model (flash-next's top-10) enters through this constant - the kernels
+/// stride plans by the runtime k, so the k == 8 path stays bit for bit what it was.
+constexpr int kMaxWinK = 10;
 struct MoeWin {
-    const unsigned long long* plan_ptr = nullptr;   // [T][8] the tokens' plans (0: an entry the GPU does not compute)
-    const float* plan_w = nullptr;                  // [T][8]
+    const unsigned long long* plan_ptr = nullptr;   // [T][k] the tokens' plans (0: an entry the GPU does not compute)
+    const float* plan_w = nullptr;                  // [T][k]
     const float* cpu_part = nullptr;                // [T][n_embd] the host's answers to disk misses, when flagged
     const int* cpu_flag = nullptr;                  // [T]
     const void* xq = nullptr;                       // the tokens' FFN inputs (q8_1), xq_stride bytes apart
@@ -28,6 +32,6 @@ struct MoeWin {
     float limit = 0.0f;
     size_t down_off = 0;
 };
-constexpr int kMaxWinTokens = kMaxMvCols;   // the window's tokens moe_win_experts groups (16 x 8 entries)
+constexpr int kMaxWinTokens = kMaxMvCols;   // the window's tokens moe_win_experts groups (kMaxWinTokens x kMaxWinK entries)
 void moe_win_group(const MoeWin& w, cudaStream_t s);
 }  // namespace strata::dsv41k::glmf
