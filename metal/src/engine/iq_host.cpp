@@ -97,6 +97,7 @@ bool native_expert_exl3_supported(int, int64_t, int64_t) noexcept { return false
 bool native_expert_grouped_exl3(const NativeExpertLayout&, const unsigned long long*, const int32_t*,
                                 const int32_t*, const int32_t*, int64_t, int, const float*, void*, float*,
                                 void*) { return false; }
+void native_expert_exl3_prepare(void*) {}
 
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);

@@ -595,10 +595,11 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 err = "hadamard.txt: layer " + std::to_string(l) + " folds a Q2_0 expert, which this engine cannot rotate";
                 return false;
             }
-            // exl3 (200) experts run on the vendored win kernels, which take the window's F32 input unrotated:
-            // a rotated exl3 layer would silently read the wrong activations.  Refuse, as for Q2_0.
-            if (f.had_gu && f.gu_type == kExl3Fmt) {
-                err = "hadamard.txt: layer " + std::to_string(l) + " folds an exl3 (200) expert's gate/up, which the "
+            // exl3 (200) experts run on the vendored win kernels, which take the window's F32 input unrotated and
+            // have no h rotation either: a rotated exl3 layer would silently read the wrong activations.  Refuse,
+            // as for Q2_0.
+            if ((f.had_gu || f.had_d) && f.gu_type == kExl3Fmt) {
+                err = "hadamard.txt: layer " + std::to_string(l) + " folds an exl3 (200) expert, which the "
                       "win kernels cannot rotate";
                 return false;
             }

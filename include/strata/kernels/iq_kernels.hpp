@@ -69,6 +69,9 @@ bool native_expert_grouped_exl3(const NativeExpertLayout& L, const unsigned long
                                 const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                 int64_t T, int route_k, const float* x_f32, void* scratch, float* parts_out,
                                 void* stream);
+/// Allocate the vendored win kernels' per-(device, stream) scratch before any CUDA graph capture: their
+/// scratch() refuses a stream first seen inside capture.  No-op without the dsv41 kernel family.
+void native_expert_exl3_prepare(void* stream);
 /// STRATA_EXPERT_NIBBLE: a converted VRAM slot - gate/up as 4-bit codes, scales and d (expert_nibble.hpp's layout:
 /// up_off = the up rows' codes, down_off = kGuBytes, bytes = the slot), the GGUF down rows after them.  IQ2_S /
 /// IQ3_XXS / IQ3_S at n_embd 2560, n_ff 640 only, and only in a build with the kernels (`native_expert_nib_supported`).

@@ -5521,7 +5521,20 @@ bool native_expert_grouped_exl3(const NativeExpertLayout& L, const unsigned long
         w.lay.suh[r] = w.lay.trellis[r] + tile;
         w.lay.svh[r] = w.lay.suh[r] + 2ull * (uint64_t) (r == 2 ? L.n_ff : L.n_embd);   // suh per input, svh per output
     }
-    return ek::win_experts(w, (cudaStream_t) stream);
+    // launch_check() counts async faults (an IMA) without failing the launch - compare the error counter around
+    // the call (44 review round 2), so a fault fails the window instead of leaving garbage parts behind.
+    const int le0 = ek::launch_errors();
+    if (!ek::win_experts(w, (cudaStream_t) stream)) return false;
+    if (ek::launch_errors() != le0) {
+        std::fprintf(stderr, "native_expert_grouped_exl3: async launch fault on the win kernels\n");
+        return false;
+    }
+    return true;
+}
+void native_expert_exl3_prepare(void* stream) {
+    // the vendored Scratch (device, stream) refuses a stream FIRST SEEN inside graph capture
+    // (exl3.cu:1243-1248) - verify captures its windows, so allocate the scratch before any capture
+    if (!ek::prepare((cudaStream_t) stream)) std::fprintf(stderr, "native_expert_exl3_prepare: scratch failed\n");
 }
 #else
 bool native_expert_grouped_exl3(const NativeExpertLayout&, const unsigned long long*, const int32_t*,
@@ -5531,6 +5544,7 @@ bool native_expert_grouped_exl3(const NativeExpertLayout&, const unsigned long l
     std::fprintf(stderr, "native_expert_grouped_exl3: this engine was built without STRATA_BUILD_DSV41\n");
     return false;
 }
+void native_expert_exl3_prepare(void*) {}
 #endif
 
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {

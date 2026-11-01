@@ -1115,6 +1115,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
+    {   // exl3-native (44 review round 2): the vendored win kernels keep a per-(device, stream) Scratch that
+        // refuses a stream FIRST SEEN inside graph capture, and verify captures its windows - allocate now.
+        const auto& elay = strata::kernels::cpu::expert_layout();
+        bool exl3_pack = false;
+        for (size_t i = 0; !exl3_pack && elay.native && i < elay.fmt.size(); ++i)
+            exl3_pack = elay.fmt[i].gu_type == strata::kernels::cpu::kExl3Fmt;
+        if (exl3_pack) strata::kernels::native_expert_exl3_prepare(cs_);
+    }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
@@ -2235,9 +2243,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (f.gu_type == strata::kernels::cpu::kExl3Fmt)
                     // exl3-native: the vendored win kernels in parts mode.  The part rows are the p_dst rows
                     // (token * K + j), so the combine, the PCIe share and the CPU rows below stay exactly what
-                    // they are for IQ experts; the win kernels take xm (the window's F32 input) directly.
-                    return strata::kernels::native_expert_grouped_exl3(L, gp, gs, gn, p_dst, n, (int) K, xm,
-                                                                       hit_scratch_, dst_buf, cs);
+                    // they are for IQ experts; the win kernels take the window's F32 input directly (the same
+                    // rows pre() reads as xm at :1490 - xm is that lambda's local, not visible here).
+                    return strata::kernels::native_expert_grouped_exl3(L, gp, gs, gn, p_dst, n, (int) K,
+                                                                       mixed_ + tb * N, hit_scratch_, dst_buf, cs);
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
             } else {
