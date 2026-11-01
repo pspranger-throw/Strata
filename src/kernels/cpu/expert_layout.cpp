@@ -422,7 +422,7 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 #if !defined(STRATA_NATIVE_EXPERTS)
 // Without ggml-cpu no native pack loads (expert_layout_load refuses), so these are never reached.
 bool native_experts_available() noexcept { return false; }
-bool native_fmt(int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err = "built without native experts"; return false; }
+bool native_fmt(int, int, int64_t, int64_t, NativeFmt&, std::string& err, int) { err = "built without native experts"; return false; }
 void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
 int native_gu_mt_min(int) { return 2; }
@@ -499,7 +499,16 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             }
         }
         if (!native_fmt((int) gt, (int) dt, H, FF, f, err, (int) K)) return false;
-        if (f.bytes != blob) {
+        // exl3 blobs are stored padded to 64 B (the v6 header says "padded"; tools/exl3/pack_exl3.py aligns the
+        // expert stride): the column is the stride, the format fixes the content - a pad under one block is fine,
+        // nothing in the blob readers crosses it.
+        if (gt == kExl3Fmt) {
+            if (blob < f.bytes || blob - f.bytes >= 64) {
+                err = "native_experts.txt: layer " + std::to_string(l) + " exl3 stride is " + std::to_string(blob) +
+                      " B, want " + std::to_string(f.bytes) + " plus less than 64 B of alignment pad";
+                return false;
+            }
+        } else if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
             return false;
@@ -584,6 +593,13 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             // the Q2_0 rows quantize their activations with Strata's own act_quant_any, which does not rotate
             if ((f.had_gu && f.gu_type == 42) || (f.had_d && f.d_type == 42)) {
                 err = "hadamard.txt: layer " + std::to_string(l) + " folds a Q2_0 expert, which this engine cannot rotate";
+                return false;
+            }
+            // exl3 (200) experts run on the vendored win kernels, which take the window's F32 input unrotated:
+            // a rotated exl3 layer would silently read the wrong activations.  Refuse, as for Q2_0.
+            if (f.had_gu && f.gu_type == kExl3Fmt) {
+                err = "hadamard.txt: layer " + std::to_string(l) + " folds an exl3 (200) expert's gate/up, which the "
+                      "win kernels cannot rotate";
                 return false;
             }
             f.gu_signs = f.had_gu ? hadamard_signs((int) f.n_embd) : nullptr;

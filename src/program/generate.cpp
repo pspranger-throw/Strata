@@ -4099,9 +4099,11 @@ int main(int argc, char** argv) {
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
         // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
         const auto& lay = strata::kernels::cpu::expert_layout();
+        bool any_exl3 = false;
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
             if (f.gu_type == strata::kernels::cpu::kExl3Fmt) {   // exl3-native packs (v6): the dsv41 win kernels
+                any_exl3 = true;
                 if (!strata::kernels::native_expert_exl3_supported(f.K, f.n_embd, f.n_ff)) {
                     std::fprintf(stderr, "strata generate: layer %lld's experts are exl3 (trellis K %d): this "
                                          "engine has no GPU kernels for them (they need a build with "
@@ -4121,6 +4123,28 @@ int main(int argc, char** argv) {
             (void) strata::prefill::mmq::supported(f.gu_type);
             (void) strata::prefill::mmq::supported(f.d_type);
 #endif
+        }
+        if (any_exl3) {
+            // exl3-native boot gates (44 review round): the peer tier and the remote caches keep experts in
+            // GGUF form and run the IQ grouped kernels, which refuse 200 blobs - refuse the combination at
+            // start, not mid-generation.  And the vendored win kernels cap a verify group at kMaxWinTokens
+            // (16) tokens, so a larger --mtp-max-t has no exl3 path yet.
+            if (o.peer_device >= 1) {
+                std::fprintf(stderr, "strata generate: --peer-device with an exl3 pack: the peer tier's cache holds "
+                                     "GGUF expert blobs and the IQ grouped kernels cannot read exl3 (200)\n");
+                return 1;
+            }
+            for (size_t r = 0; r < o.expert_cache_remote.size(); ++r)
+                if (o.expert_cache_remote[r] > 0 || o.expert_cache_remote_auto[r]) {
+                    std::fprintf(stderr, "strata generate: remote expert caches (--expert-cache-device/auto) hold "
+                                         "GGUF blobs: not with an exl3 pack in this build\n");
+                    return 1;
+                }
+            if (o.mtp_max_t > 16) {
+                std::fprintf(stderr, "strata generate: exl3 packs cap the verify window at 16 tokens (the vendored "
+                                     "win kernels' kMaxWinTokens): --mtp-max-t %d is too large\n", o.mtp_max_t);
+                return 1;
+            }
         }
         // APR (prism.hadamard) packs: every expert path rotates its activations (CPU pool: native_quant_act / _h;
         // GPU verify, remote GPUs, prompt FP16 path: hadamard_rows).  Validated end to end on CUDA (sm_86, sm_89 with

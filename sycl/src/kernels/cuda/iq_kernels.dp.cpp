@@ -5027,7 +5027,7 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
            n_embd % 256 == 0 && (n_ff * n_embd) % 256 == 0;
 }
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int) {
     NativeExpertLayout L;
     L.gu_type = gu_type;
     L.d_type = d_type;

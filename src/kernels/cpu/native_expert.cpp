@@ -407,6 +407,12 @@ int native_gu_mt_min(int gu_type) {
 template <NativeArithmetic Arithmetic>
 void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    // exl3 (200) blobs have no CPU row kernels yet: ggml's type table would be read out of range at 200
+    // (GGML_TYPE_COUNT = 43).  Loud refusal, never a garbage dot product; the win-kernel path is GPU-side.
+    if (f.gu_type == kExl3Fmt || f.d_type == kExl3Fmt) {
+        std::fprintf(stderr, "native_gu_rows: exl3 (200) experts have no CPU row kernels\n");
+        std::exit(1);
+    }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
@@ -553,6 +559,10 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
 template <NativeArithmetic Arithmetic>
 void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (f.gu_type == kExl3Fmt || f.d_type == kExl3Fmt) {   // as in native_gu_rows_impl: no CPU kernels for 200
+        std::fprintf(stderr, "native_down_rows: exl3 (200) experts have no CPU row kernels\n");
+        std::exit(1);
+    }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;

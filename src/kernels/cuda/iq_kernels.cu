@@ -5523,6 +5523,14 @@ bool native_expert_grouped_exl3(const NativeExpertLayout& L, const unsigned long
     }
     return ek::win_experts(w, (cudaStream_t) stream);
 }
+#else
+bool native_expert_grouped_exl3(const NativeExpertLayout&, const unsigned long long*, const int32_t*,
+                                const int32_t*, const int32_t*, int64_t, int, const float*, void*, float*, void*) {
+    // link integrity for builds without the dsv41 kernel family: native_expert_exl3_supported already refuses a
+    // 200 pack at startup there, so this is the safety net, not the gate
+    std::fprintf(stderr, "native_expert_grouped_exl3: this engine was built without STRATA_BUILD_DSV41\n");
+    return false;
+}
 #endif
 
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {

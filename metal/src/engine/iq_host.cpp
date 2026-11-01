@@ -76,7 +76,7 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
            n_embd % 256 == 0 && (n_ff * n_embd) % 256 == 0;   // (the trellis rows: 128-value blocks, 2560 = 20, 640 = 5)
 }
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int) {
     NativeExpertLayout L;
     L.gu_type = gu_type;
     L.d_type = d_type;
@@ -89,6 +89,14 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.bytes = L.down_off + (size_t) n_embd * L.d_row;
     return L;
 }
+
+// exl3-native (200) experts: Metal has no dsv41 kernel family, so the pack is refused at startup by
+// native_expert_supported / native_expert_exl3_supported; these exist for link integrity of the shared
+// verify.cpp / generate.cpp the Metal build compiles.
+bool native_expert_exl3_supported(int, int64_t, int64_t) noexcept { return false; }
+bool native_expert_grouped_exl3(const NativeExpertLayout&, const unsigned long long*, const int32_t*,
+                                const int32_t*, const int32_t*, int64_t, int, const float*, void*, float*,
+                                void*) { return false; }
 
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
