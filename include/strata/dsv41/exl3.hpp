@@ -130,6 +130,10 @@ struct WinArgs {
     ExpertLayout lay;
     int T = 0, k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
+    // plan_ptr == nullptr: parts mode - win_combine never runs (and plan_w / cpu_part / sh_out / wait go unused):
+    // each entry's unweighted down row is left at part[e], e a grp_ent value, for an engine that weights and
+    // combines the entries itself.  A qwen window packs its entries as rows token * k + j, so passing ent_dst as
+    // grp_ent puts every part exactly on the row that engine's combine reads - and token = e / k stays right.
     // (given) the combine first waits on the device until *wait_ptr == wait_val (the host's answer to the CPU lane's
     // part arrives while the device computes the experts); cpu_flag may be null (no CPU part)
     const unsigned* wait_ptr = nullptr;

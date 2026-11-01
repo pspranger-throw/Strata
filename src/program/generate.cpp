@@ -4101,7 +4101,14 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
-            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
+            if (f.gu_type == strata::kernels::cpu::kExl3Fmt) {   // exl3-native packs (v6): the dsv41 win kernels
+                if (!strata::kernels::native_expert_exl3_supported(f.K, f.n_embd, f.n_ff)) {
+                    std::fprintf(stderr, "strata generate: layer %lld's experts are exl3 (trellis K %d): this "
+                                         "engine has no GPU kernels for them (they need a build with "
+                                         "STRATA_BUILD_DSV41=ON, the exl3-native bridge)\n", (long long) l, f.K);
+                    return 1;
+                }
+            } else if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
                 std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
                                      "engine has no GPU kernels for\n", (long long) l,
                              strata::ggml_type_name((uint32_t) f.gu_type), strata::ggml_type_name((uint32_t) f.d_type),

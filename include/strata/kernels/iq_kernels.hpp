@@ -44,6 +44,7 @@ void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t 
 struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;
     int64_t n_embd = 0, n_ff = 0;
+    int K = 0;                          // exl3 (200) only: the trellis width of all three roles; 0 for the rest
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
@@ -55,7 +56,19 @@ struct NativeExpertLayout {
                                         // slot); set only by native_expert_layout_nib
     const float* d_signs = nullptr;
 };
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int K = 0);
+/// exl3 (200) experts in a verify window need the dsv41 kernel family linked into this build (STRATA_BUILD_DSV41,
+/// the exl3-native bridge); false (refusing the pack at startup) without it, or with a K/dim the kernels refuse.
+bool native_expert_exl3_supported(int K, int64_t n_embd, int64_t n_ff) noexcept;
+/// Grouped exl3 experts for one verify window, over the vendored win kernels in parts mode: group g's blob at
+/// grp_ptr[g], its entries [grp_start[g], grp_start[g+1]) numbered by their parts row ent_dst[e] = t * route_k +
+/// j (token = row / route_k, exactly the vendored grp_ent convention); T tokens' F32 inputs at x_f32 (rows n_embd
+/// apart), each entry's unweighted down row written at parts_out + ent_dst[e] * n_embd.  `scratch` holds h,
+/// native_expert_scratch_bytes(cap_entries, n_ff) covers it.  False: the shape is not covered (loud).
+bool native_expert_grouped_exl3(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                int64_t T, int route_k, const float* x_f32, void* scratch, float* parts_out,
+                                void* stream);
 /// STRATA_EXPERT_NIBBLE: a converted VRAM slot - gate/up as 4-bit codes, scales and d (expert_nibble.hpp's layout:
 /// up_off = the up rows' codes, down_off = kGuBytes, bytes = the slot), the GGUF down rows after them.  IQ2_S /
 /// IQ3_XXS / IQ3_S at n_embd 2560, n_ff 640 only, and only in a build with the kernels (`native_expert_nib_supported`).

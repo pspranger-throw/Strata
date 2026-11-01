@@ -11,6 +11,11 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#if defined(STRATA_EXL3_NATIVE)
+#include "strata/dsv41/exl3.hpp"        // exl3-native bridge: the vendored win kernels run exl3 (200) experts
+#include "strata/dsv41/moe_win.hpp"     // ... and the shared plan-width constants (kMaxWinK, kMaxWinTokens)
+#include "strata/kernels/cpu/native_expert.hpp"   // kExl3Fmt, kExpertLayout v6's format id
+#endif
 #include "s26_tsum.cuh"
 
 #include <cuda_fp16.h>
@@ -5463,6 +5468,63 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
            n_embd % 256 == 0 && (n_ff * n_embd) % 256 == 0;
 }
 
+bool native_expert_exl3_supported(int K, int64_t n_embd, int64_t n_ff) noexcept {
+#if defined(STRATA_EXL3_NATIVE)
+    // win_experts' own guard (exl3.cu): column-block multiples and the kernel family's dimension ceiling
+    // (kMaxMoeK = 8192 there); the trellis K is the codec width (1..8); several_ok() gates the many-activation
+    // kernels to devices that run them (every CUDA card does; the check keeps HIP off the tc path honest).
+    return K >= 1 && K <= 8 && n_embd > 0 && n_embd % 128 == 0 && n_embd <= 8192 &&
+           n_ff > 0 && n_ff % 128 == 0 && n_ff <= 8192 && strata::dsv41k::exl3::several_ok();
+#else
+    (void) K; (void) n_embd; (void) n_ff;
+    return false;   // no dsv41 kernel family in this build: an exl3 pack is refused at startup, never run wrong
+#endif
+}
+
+#if defined(STRATA_EXL3_NATIVE)
+bool native_expert_grouped_exl3(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                int64_t T, int route_k, const float* x_f32, void* scratch, float* parts_out,
+                                void* stream) {
+    namespace ek = strata::dsv41k::exl3;
+    namespace gf = strata::dsv41k::glmf;
+    if (!native_expert_exl3_supported(L.K, L.n_embd, L.n_ff) || T < 1 || T > gf::kMaxWinTokens || route_k < 1 ||
+        route_k > gf::kMaxWinK || L.gu_type != cpu::kExl3Fmt || grp_ptr == nullptr || grp_start == nullptr ||
+        n_groups == nullptr || ent_dst == nullptr || x_f32 == nullptr || scratch == nullptr || parts_out == nullptr) {
+        std::fprintf(stderr, "native_expert_grouped_exl3: not covered (T %lld route_k %d trellis K %d n_embd %lld "
+                             "n_ff %lld)\n", (long long) T, route_k, L.K, (long long) L.n_embd, (long long) L.n_ff);
+        return false;
+    }
+    ek::WinArgs w{};
+    w.grp_ptr = grp_ptr;
+    w.grp_start = grp_start;
+    w.n_groups = n_groups;
+    w.grp_ent = ent_dst;      // the parts row is token * route_k + j, so / route_k is the token (exactly the
+                              // vendored grp_ent convention) and part[e] lands on the row the combine reads
+    w.plan_ptr = nullptr;     // parts mode: the kernels do not combine; verify weights the entries from w_
+    w.x = x_f32;
+    w.x_stride = (size_t) L.n_embd * 4;
+    w.h = (float*) scratch;   // h rows are numbered by grp_ent values, all below T * route_k
+    w.part = parts_out;
+    w.out = parts_out;        // parts mode never reads out; the vendored guard wants it non-null
+    w.out_stride = (size_t) L.n_embd * 4;
+    w.limit = 0.0f;           // flash-next's FFN is plain swiglu (the IQ window path applies no clamp either)
+    w.T = (int) T;
+    w.k = route_k;
+    w.n_embd = (int) L.n_embd;
+    w.n_ff = (int) L.n_ff;
+    w.lay.cb = 2;             // mul1 codebook: the G0 census - every exl3-250 tensor is cb 2
+    const uint64_t tile = (uint64_t) (L.n_embd / 16) * (uint64_t) (L.n_ff / 16) * 32ull * (uint64_t) L.K;
+    for (int r = 0; r < 3; ++r) {
+        w.lay.K[r] = L.K;
+        w.lay.trellis[r] = r == 0 ? 0ull : (r == 1 ? (uint64_t) L.up_off : (uint64_t) L.down_off);
+        w.lay.suh[r] = w.lay.trellis[r] + tile;
+        w.lay.svh[r] = w.lay.suh[r] + 2ull * (uint64_t) (r == 2 ? L.n_ff : L.n_embd);   // suh per input, svh per output
+    }
+    return ek::win_experts(w, (cudaStream_t) stream);
+}
+#endif
+
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
     NativeExpertLayout L;
     L.gu_type = gu_type;
@@ -5480,6 +5542,20 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
         L.tail_off = L.bytes;
         L.bytes += 16;
     }
+    // exl3 (200): the blob is three roles of trellis planes + heads + the 16 B mul1 tail - one formula with
+    // cpu::native_fmt's exl3 arm (native_expert.hpp): per role (k/16)(n/16)*32K trellis + (k+n)*2 heads.
+    // A non-bridge build refuses 200 at startup before any layout is built (native_expert_exl3_supported).
+#if defined(STRATA_EXL3_NATIVE)
+    if (gu_type == cpu::kExl3Fmt || d_type == cpu::kExl3Fmt) {
+        L.K = K;
+        const uint64_t tile = (uint64_t) (n_embd / 16) * (uint64_t) (n_ff / 16) * 32ull * (uint64_t) K;
+        const uint64_t head = (uint64_t) (n_embd + n_ff) * 2ull;
+        L.gu_row = L.d_row = 0;   // planes, not quant rows: nothing here may index by row bytes
+        L.up_off = (size_t) (tile + head);
+        L.down_off = (size_t) (2 * (tile + head));
+        L.bytes = (size_t) (3 * (tile + head) + 16);
+    }
+#endif
     return L;
 }
 
@@ -6248,6 +6324,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (L.gu_type == 200 || L.d_type == 200) {   // exl3 (kExl3Fmt): only native_expert_grouped_exl3 reads these
+        std::fprintf(stderr, "native_expert_grouped: exl3 (200) experts must go through "
+                             "native_expert_grouped_exl3\n");
+        std::exit(1);
+    }
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;

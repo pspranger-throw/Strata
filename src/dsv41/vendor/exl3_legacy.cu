@@ -961,7 +961,8 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     if (!dispatch<RunWin>(a.lay.K[0], a.lay.cb, w, groups, s) ||
         !dispatch<RunWinDown>(a.lay.K[2], a.lay.cb, w, groups, s))
         return false;
-    strata_ds4_launch(win_combine_kernel, dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, s, w);
+    if (a.plan_ptr != nullptr)   // parts mode (plan_ptr null): the engine combines the weighted entries itself
+        strata_ds4_launch(win_combine_kernel, dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, s, w);
     launch_check("win_experts");
     return true;
 }

@@ -915,6 +915,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     endif()
     target_include_directories(strata_dsv41_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(strata_dsv41_kernels PUBLIC ${_strata_gpu_runtime_target})
+    # exl3-native bridge: the qwen engine's window verify runs exl3 (200) experts on the vendored win kernels
+    # (iq_kernels' adapter, parts mode).  Without STRATA_EXL3_NATIVE the adapter arms do not compile and an exl3
+    # pack is refused at startup by native_expert_exl3_supported.
+    if(TARGET strata_kernels)
+      target_link_libraries(strata_kernels PRIVATE strata_dsv41_kernels)
+      target_compile_definitions(strata_kernels PRIVATE STRATA_EXL3_NATIVE=1)
+    endif()
     add_executable(strata-dsv41 src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu src/dsv41/ds4_vision.cu
                    src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
                    src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp)
