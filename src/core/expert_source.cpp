@@ -1443,7 +1443,14 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
         uint64_t at = 0;
         for (int64_t layer = 0; layer < n_layers; ++layer) {
             const size_t i = (size_t) layer;
-            const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
+            uint64_t bytes = (uint64_t) layout.fmt[i].bytes;   // the size the format fixes
+            // exl3 (200) experts.bin stores each expert padded to 64 B (native_experts.txt v6's header:
+            // "padded to 64 B"): the column is the STRIDE, and every reader - offsets, staging, totals -
+            // must stride by it.  For a 200 layer a pad under one block is accepted, and `bytes` becomes
+            // the stride so the equality below and layer_blob_bytes both speak stride, never raw.
+            if (layout.fmt[i].gu_type == strata::kernels::cpu::kExl3Fmt &&
+                layout.bytes[i] >= bytes && layout.bytes[i] - bytes < 64)
+                bytes = layout.bytes[i];
             if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
                 bytes > std::numeric_limits<uint64_t>::max() / (uint64_t) n_expert) {
                 err = "FileExpertSource: the native expert layout is invalid at layer " + std::to_string(layer);
