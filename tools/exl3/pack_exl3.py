@@ -42,7 +42,10 @@ ROLES = ("gate_proj", "up_proj", "down_proj")
 TRELLIS_TAIL = 16  # {mul1_gate, mul1_up, mul1_down, 0} I32; mirrors iq_pack NVFP4_TAIL
 K_TYPE_EXL3 = 200  # reserved format id, include/strata/dsv41/exl3.hpp:30
 KIND = {"BF16": 4, "F16": 5, "F32": 2}  # index.txt kinds, tools/iq_pack.py:90
-GGUF_ESZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 8: 8, 9: 8, 10: 1}
+# strata's GGUF dialect (include/strata/artifact/gguf_reader.hpp:322): MetaType extends the stock
+# GGUF enum with U64=10, I64=11, F64=12 (stock GGUF has 10=USTRING; strata files use the 10-12 ints,
+# e.g. qwen4exp.ple.head_offsets is a U64 array).  8=STRING, 9=ARRAY.
+GGUF_ESZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 8: 8, 9: 8, 10: 8, 11: 8, 12: 8}
 
 
 def align_up(x: int, a: int = ALIGN) -> int:
@@ -102,22 +105,24 @@ def sha256_file(p: pathlib.Path, blk: int = 1 << 20) -> str:
 def gguf_meta_copy(src_gguf: pathlib.Path, dst: pathlib.Path) -> tuple[int, int]:
     """Copy GGUF magic/version/KV bytes verbatim; rewrite n_tensors to 0.  Returns (n_tensors, n_kv)."""
 
+    def read_str(fh):
+        (tl,) = struct.unpack("<Q", fh.read(8))
+        fh.read(tl)
+
     def kv_end_position(fh, n_kv: int) -> int:
-        """fh is positioned at the KV section start; walk the records, return the section end."""
+        """fh is positioned at the KV section start; walk the records, return the section end.
+        Value types follow strata's enum (GGUF_ESZ above): 8 = STRING, 9 = ARRAY, else fixed size."""
         for _ in range(n_kv):
-            (tl,) = struct.unpack("<Q", fh.read(8))
-            fh.read(tl)
+            read_str(fh)  # key
             (t,) = struct.unpack("<I", fh.read(4))
             if t == 8:
-                (tl,) = struct.unpack("<Q", fh.read(8))
-                fh.read(tl)
-            elif t in (9, 10):
+                read_str(fh)
+            elif t == 9:
                 (at,) = struct.unpack("<I", fh.read(4))
                 (an,) = struct.unpack("<Q", fh.read(8))
                 if at == 8:
                     for _ in range(an):
-                        (tl,) = struct.unpack("<Q", fh.read(8))
-                        fh.read(tl)
+                        read_str(fh)
                 else:
                     fh.read(an * GGUF_ESZ[at])
             else:
@@ -199,7 +204,7 @@ def main() -> int:
                     for part in ("trellis", "suh", "svh"):
                         blob += s.raw(pre + r + "." + part)
                     b = s.raw(pre + r + ".mul1")
-                    _, _, dt, shp = s.loc[pre + r + ".mul1"]
+                    dt, shp = s.loc[pre + r + ".mul1"][3:5]
                     assert dt == "I32" and shp == () and len(b) == 4, f"{pre}{r}.mul1 {dt} {shp}"
                     mul1s.append(struct.unpack("<i", b)[0])
                 blob += struct.pack("<4i", *mul1s, 0)
@@ -237,7 +242,7 @@ def main() -> int:
             parts = grouped[base]
             if not parts:  # plain F16/BF16 tensor, generic loader serves it
                 b = s.raw(base)
-                _, _, dt, shp = s.loc[base]
+                dt, shp = s.loc[base][3:5]
                 assert dt in KIND, f"{base}: dtype {dt} is not a plain index kind"
                 n = len(b)
                 fh.write(b + b"\x00" * (align_up(n) - n))
