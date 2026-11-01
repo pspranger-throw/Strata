@@ -320,14 +320,17 @@ def main() -> int:
                 n_bad += 1
                 continue
             if form == "shape":
-                if f2[10] != "8":
+                if f2[9] != "8" or f2[11] != "32":
                     n_bad += 1
+                    print(f"  shape row wrong: {cname} fields {f2[9]}/{f2[11]}")
                 continue
             want = conv46(raw[base], raw.tmap[base][0], form)
             df.seek(int(f2[3]))
             got = df.read(len(want))
             if got != want:
                 n_bad += 1
+                print(f"  index byte mismatch: {base} -> {cname} (src dtype {raw.tmap[base][0]}, "
+                      f"form {form}, {len(want)} B)")
     check(n_bad == 0, f"index rows every byte incl form conversion ({n_bad} bad)")
     check(len(ilines) == sum(1 for p_ in groups.values() if not p_),
           f"index rows == source plain tensors ({len(ilines)})")
