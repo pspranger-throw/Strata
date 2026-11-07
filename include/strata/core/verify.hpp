@@ -719,4 +719,8 @@ private:
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 
+/// 46 diagnostic: the first window's per-layer R, hc*n_embd floats per (layer, token<=max_t) row,
+/// captured when STRATA_CKPT_LAYERS is set; nullptr until the first commit has mirrored it.
+const float* ckpt_layers(int64_t* dims);
+
 }  // namespace strata::core

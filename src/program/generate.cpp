@@ -19167,6 +19167,24 @@ int main(int argc, char** argv) {
                     o.dump_residual.c_str(), (int) g.hc, (long long) g.n_embd, bad, mag / (double) R.size(), mx);
     }
 
+    // ---- 46 diagnostic: the first window's per-layer R (STRATA_CKPT_LAYERS=<path>, see verify.cpp)
+    if (const char* ce = std::getenv("STRATA_CKPT_LAYERS"); ce != nullptr && ce[0] != '\0') {
+        int64_t dims[3] = {0, 0, 0};
+        const float* p = strata::core::ckpt_layers(dims);
+        std::FILE* cf = std::fopen(ce, "wb");
+        if (cf == nullptr) {
+            std::fprintf(stderr, "strata generate: cannot write %s\n", ce);
+        } else {
+            const int32_t hdr[3] = {(int32_t) dims[0], (int32_t) dims[1], (int32_t) dims[2]};
+            std::fwrite(hdr, sizeof hdr, 1, cf);
+            if (p != nullptr) std::fwrite(p, sizeof(float), (size_t) (dims[0] * dims[1] * dims[2]), cf);
+            std::fclose(cf);
+            std::printf("%-24s %s (%lld layers x %lld rows x %lld floats, %s)\n", "layer ckpt", ce,
+                        (long long) dims[0], (long long) dims[1], (long long) dims[2],
+                        p != nullptr ? "first window captured" : "never captured");
+        }
+    }
+
     if (o.stats) {
         std::printf("%-24s %.3f ms/token (WALL CLOCK: embed, layers, head, sample)\n", "  per token", decode_ms);
         // **THE PER-TOKEN HOST TERM, WHICH `--gpu-only-full` CANNOT SEE.**  That measurement never enters the

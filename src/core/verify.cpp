@@ -99,6 +99,17 @@ bool window_run_slots(void* w, const int* rows, int S, const int32_t* tokens, co
 namespace strata::core {
 namespace {
 
+// ---- 46 soup forensics: STRATA_CKPT_LAYERS=<path> captures the window's per-layer residual R.
+// A device ring (layers x max_t x hc*n_embd) is written by a captured D2D copy after each post(l);
+// the first commit mirrors it once to pinned host, where the CLI reads it. Diagnostic only.
+struct Ckpt {
+    bool on = false, saved = false;
+    float* ring = nullptr;   // device
+    float* host = nullptr;   // pinned, one-shot
+    int64_t layers = 0, mt = 0, hcn = 0;
+} ck;
+
+
 constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
@@ -1051,6 +1062,21 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         had_sx_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) g.n_embd), (int) g.n_embd);
         had_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) g.n_ff), (int) g.n_ff);
     }
+    {   // 46 diagnostic: the per-layer R ring, allocated before any capture so the copies can bake in
+        if (const char* e = std::getenv("STRATA_CKPT_LAYERS"); e != nullptr && e[0] != '\0' && !ck.on) {
+            ck.on = true;
+            ck.layers = g.n_layers;
+            ck.mt = max_t_;
+            ck.hcn = (int64_t) g.hc * (int64_t) g.n_embd;
+            const size_t bytes = (size_t) ((6 * ck.layers + 4) * ck.mt * ck.hcn) * sizeof(float);
+            if (cudaMalloc(&ck.ring, bytes) != cudaSuccess ||
+                cudaHostAlloc(&ck.host, bytes, cudaHostAllocDefault) != cudaSuccess) {
+                std::fprintf(stderr, "verify: STRATA_CKPT_LAYERS: ring alloc failed\n");
+                (void) cudaGetLastError();
+                ck.on = false;
+            }
+        }
+    }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
@@ -1336,6 +1362,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
         ne->gather_dev(tok_, T, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+        if (ck.on && ck.ring != nullptr) {   // 46 diagnostic: the gathered embed, and R_ right after broadcast
+            const int tb = tb_[0], te = te_[0];
+            if (cudaMemcpyAsync(ck.ring + ((size_t) ck.layers * ck.mt + (size_t) tb) * ck.hcn, emb_ + (size_t) tb * N,
+                                (size_t) (te - tb) * N * sizeof(float), cudaMemcpyDeviceToDevice, cs) != cudaSuccess)
+                (void) cudaGetLastError();
+            if (cudaMemcpyAsync(ck.ring + ((size_t) (6 * ck.layers + 2) * ck.mt + (size_t) tb) * ck.hcn,
+                                R_ + (size_t) tb * ck.hcn, (size_t) (te - tb) * ck.hcn * sizeof(float),
+                                cudaMemcpyDeviceToDevice, cs) != cudaSuccess)
+                (void) cudaGetLastError();
+        }
     } else {
         const WeightRef* w = wt.find("token_embd.weight");
         if (w == nullptr || w->codebook_iq4nl || (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)) {
@@ -2420,12 +2456,62 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         return true;
     };
 
-    for (int grp = 0; grp < G; ++grp)
+    for (int grp = 0; grp < G; ++grp) {
         if (!pre(lb_, grp)) return false;
+        if (ck.on && ck.ring != nullptr) {   // 46 diagnostic: this layer's attn out + pre-attn xn
+            const int tb = tb_[grp], te = te_[grp];
+            if (cudaMemcpyAsync(ck.ring + ((size_t) (4 * ck.layers + 2 + lb_) * ck.mt + (size_t) tb) * ck.hcn,
+                                bo_ + (size_t) tb * N, (size_t) (te - tb) * N * sizeof(float),
+                                cudaMemcpyDeviceToDevice, cs) != cudaSuccess) (void) cudaGetLastError();
+            if (cudaMemcpyAsync(ck.ring + ((size_t) (5 * ck.layers + 2 + lb_) * ck.mt + (size_t) tb) * ck.hcn,
+                                xn_ + (size_t) tb * ck.hcn, (size_t) (te - tb) * ck.hcn * sizeof(float),
+                                cudaMemcpyDeviceToDevice, cs) != cudaSuccess) (void) cudaGetLastError();
+            if (cudaMemcpyAsync(ck.ring + ((size_t) (6 * ck.layers + 3 + lb_) * ck.mt + (size_t) tb) * ck.hcn,
+                                R_ + (size_t) tb * ck.hcn, (size_t) (te - tb) * ck.hcn * sizeof(float),
+                                cudaMemcpyDeviceToDevice, cs) != cudaSuccess) (void) cudaGetLastError();
+        }
+    }
     for (int64_t l = lb_; l < le_; ++l)
         for (int grp = 0; grp < G; ++grp) {
             if (!post(l, grp)) return false;
-            if (l + 1 < le_ && !pre(l + 1, grp)) return false;
+            if (ck.on && ck.ring != nullptr) {   // 46 diagnostic: this layer's R rows for the window
+                const int tb = tb_[grp], te = te_[grp];
+                if (cudaMemcpyAsync(ck.ring + ((size_t) l * ck.mt + (size_t) tb) * ck.hcn, Rt(tb),
+                                    (size_t) (te - tb) * ck.hcn * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                    (void) cudaGetLastError();   // diagnostic: a refused copy only loses the ring
+                }
+                if (cudaMemcpyAsync(ck.ring + ((size_t) (ck.layers + 1 + l) * ck.mt + (size_t) tb) * ck.hcn,
+                                    bo_ + (size_t) tb * N, (size_t) (te - tb) * N * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                }
+                if (cudaMemcpyAsync(ck.ring + ((size_t) (2 * ck.layers + 2 + l) * ck.mt + (size_t) tb) * ck.hcn,
+                                    xn_ + (size_t) tb * ck.hcn, (size_t) (te - tb) * ck.hcn * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                }
+                if (cudaMemcpyAsync(ck.ring + ((size_t) (3 * ck.layers + 2 + l) * ck.mt + (size_t) tb) * ck.hcn,
+                                    inj2_ + (size_t) tb * (size_t) HC, (size_t) (te - tb) * (size_t) HC * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                }
+            }
+            if (l + 1 < le_) {
+                if (!pre(l + 1, grp)) return false;
+                if (ck.on && ck.ring != nullptr) {   // 46 diagnostic: layer l+1's attn out + pre-attn xn
+                    const int tb = tb_[grp], te = te_[grp];
+                    if (cudaMemcpyAsync(ck.ring + ((size_t) (4 * ck.layers + 2 + l + 1) * ck.mt + (size_t) tb) * ck.hcn,
+                                        bo_ + (size_t) tb * N, (size_t) (te - tb) * N * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, cs) != cudaSuccess) (void) cudaGetLastError();
+                    if (cudaMemcpyAsync(ck.ring + ((size_t) (5 * ck.layers + 2 + l + 1) * ck.mt + (size_t) tb) * ck.hcn,
+                                        xn_ + (size_t) tb * ck.hcn, (size_t) (te - tb) * ck.hcn * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, cs) != cudaSuccess) (void) cudaGetLastError();
+                    if (cudaMemcpyAsync(ck.ring + ((size_t) (6 * ck.layers + 3 + l + 1) * ck.mt + (size_t) tb) * ck.hcn,
+                                        R_ + (size_t) tb * ck.hcn, (size_t) (te - tb) * ck.hcn * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, cs) != cudaSuccess) (void) cudaGetLastError();
+                }
+            }
         }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         float* hout = hand_out_ + (size_t) hrow0 * HB;
@@ -3729,6 +3815,12 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[0] = ss_->ple_prev[1];
             ss_->ple_prev[1] = last_tokens_[t];
         }
+    if (ck.on && !ck.saved && ck.ring != nullptr && ck.host != nullptr &&
+        last_t_ >= 1 && last_t_ <= ck.mt) {   // 46 diagnostic: keep the first window's ring
+        if (cudaMemcpy(ck.host, ck.ring, (size_t) ((6 * ck.layers + 4) * ck.mt * ck.hcn) * sizeof(float),
+                       cudaMemcpyDeviceToHost) == cudaSuccess)
+            ck.saved = true;
+    }
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit(n_keep, err);
 }
@@ -3745,6 +3837,12 @@ bool Verifier::wait_commit(std::string& err) {
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
     return next_ == nullptr || next_->wait_commit(err);
+}
+
+const float* ckpt_layers(int64_t* dims) {   // 46 diagnostic: the first window's per-layer R (see Ckpt).
+    if (!ck.on || !ck.saved) return nullptr;   // slot layers: embed; +1+l: bo; 2L+2+l: xn; 3L+2+l: inj2 (HC floats)
+    dims[0] = 6 * ck.layers + 4; dims[1] = ck.mt; dims[2] = ck.hcn;
+    return ck.host;
 }
 
 
