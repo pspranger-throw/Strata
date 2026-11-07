@@ -134,6 +134,88 @@ def convert_form(b: bytes, src_dtype: str, form: str) -> tuple[bytes, str]:
                else np.frombuffer(b, "<f4"))
         return (src.astype("<f2").tobytes(), F16)
     raise AssertionError(f"form conversion {src_dtype} -> {form} not implemented")
+
+# ---- GDN V-head reorder + Qwen3Next +1 gammas (ground truth: llama.cpp conversion/qwen.py
+# _LinearAttentionVReorderBase + Qwen3NextModel + conversion/qwen4exp.py; every transform below
+# verified against the iq3_s pack's regions, issues 46, 2026-11-07).  The engine's canonical
+# layout is the GGUF layout; the exl3 archive stands in HF layout, so every affected row/tile
+# must be reordered or shifted before it enters dense.bin. ----
+def _reorder_v_heads(v, dim: int, K: int = 16, r: int = 3, hd: int = 1):
+    shp = list(v.shape)
+    if dim < 0:
+        dim += len(shp)
+    tt = v.reshape(*shp[:dim], K, r, hd, *shp[dim + 1:])
+    perm = list(range(tt.ndim))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return np.transpose(tt, perm).reshape(shp)
+
+def _vhead_perm(total: int, base: int, hd: int) -> list[int]:
+    p = list(range(total))
+    for h in range((total - base) // hd):
+        hs = (h % 16) * 3 + h // 16
+        for d in range(hd):
+            p[base + h * hd + d] = base + hs * hd + d
+    return p
+
+# ---- decode/encode bracket for canon_transform: bit-identical to convert_form's arms ----
+def decode_raw(b: bytes, src_dtype: str):
+    if src_dtype == "BF16":
+        return (np.frombuffer(b, "<u2").astype("<u4") << 16).view("<f4")
+    if src_dtype == "F16":
+        return np.frombuffer(b, "<f2").astype("<f4")
+    if src_dtype == "F32":
+        return np.frombuffer(b, "<f4")
+    raise AssertionError(f"decode: source dtype {src_dtype} not a canonical float")
+
+def encode_form(v, form: str) -> bytes:
+    if form == F32:
+        return np.asarray(v, "<f4").tobytes()
+    if form == BF16:
+        u = np.asarray(v, "<f4").view("<u4")
+        return (((u + 0x7FFF + ((u >> 16) & 1)) >> 16)).astype("<u2").tobytes()
+    if form == F16:
+        return np.asarray(v, "<f2").tobytes()
+    raise AssertionError(f"encode: form {form} unknown")
+
+def canon_transform(cname: str, v, shp: tuple = ()):
+    """Canonical transform of a decoded float32 array (HF order -> GGUF order).
+    `shp` is the source tensor shape; the reorder families need it (decode gives a flat array)."""
+    n = cname.split(".", 2)[2] if cname.startswith("blk.") else cname
+    if len(shp) > 1 and v.ndim == 1 and v.size == int(np.prod(shp)):
+        v = v.reshape(shp)
+    if n == "ssm_a":
+        return _reorder_v_heads(-np.exp(v.astype(np.float64)).astype(np.float32), 0)
+    if n in ("ssm_dt.bias", "ssm_alpha.weight", "ssm_beta.weight"):
+        return _reorder_v_heads(v, 0)
+    if n == "ssm_conv1d.weight":
+        v = v.reshape(-1, 4)
+        assert v.shape[0] == 10240, f"{cname}: conv rows {v.shape}"
+        return np.concatenate([v[:4096], _reorder_v_heads(v[4096:], 0, 16, 3, 128)], 0).ravel()
+    if n == "ple_conv1d.weight":
+        return v.reshape(-1)    # squeeze only; GGUF keeps raw gammas (no +1; 46 sweep 2026-11-07)
+    if n in ("hc_attn_norm.weight", "hc_ffn_norm.weight", "attn_q_norm.weight", "attn_k_norm.weight",
+             "indexer.q_norm.weight", "indexer.k_norm.weight", "ple_norm_key.weight", "ple_norm_query.weight",
+             "ple_norm_conv.weight", "output_hc_norm.weight"):
+        return v + np.float32(1.0)
+    return v
+
+def exl3_reorder(cname: str, tr, suh: bytes, svh: bytes):
+    """Reorder an exl3 matrix's trellis tiles + scale vectors for the GDN V-head layout."""
+    n = cname.split(".", 2)[2] if cname.startswith("blk.") else cname
+    if n in ("attn_qkv.weight", "attn_gate.weight"):
+        base = 256 if n == "attn_qkv.weight" else 0     # qkv: q,k rows stand; v rows reorder
+        assert base + 384 == tr.shape[1], f"{cname}: n tiles {tr.shape[1]}"
+        tr = tr[:, _vhead_perm(tr.shape[1], base, 8), :]
+        sv = np.frombuffer(svh, "<f2")
+        sv = sv[_vhead_perm(len(sv), base * 16, 128)]
+        return tr, suh, sv.tobytes()
+    if n == "ssm_out.weight":
+        assert tr.shape[0] == 384, f"{cname}: k tiles {tr.shape[0]}"
+        tr = tr[_vhead_perm(384, 0, 8), :, :]
+        su = np.frombuffer(suh, "<f2")
+        su = su[_vhead_perm(len(su), 0, 128)]
+        return tr, su.tobytes(), svh
+    return tr, suh, svh
 # strata's GGUF dialect (include/strata/artifact/gguf_reader.hpp:322): MetaType extends the stock
 # GGUF enum with U64=10, I64=11, F64=12 (stock GGUF has 10=USTRING; strata files use the 10-12 ints,
 # e.g. qwen4exp.ple.head_offsets is a U64 array).  8=STRING, 9=ARRAY.
@@ -248,6 +330,7 @@ def main() -> int:
     ap.add_argument("--out", required=True, type=pathlib.Path, help="output strata pack directory")
     ap.add_argument("--gguf-meta", required=True, type=pathlib.Path,
                     help="same-architecture GGUF whose KV section becomes metadata.gguf")
+    ap.add_argument("--dense-only", action="store_true", help="rewrite only dense.bin/exl3_dense.txt/index.txt (transforms fix, 46)")
     a = ap.parse_args()
     src, out = a.src, a.out
     out.mkdir(parents=True, exist_ok=True)
@@ -291,39 +374,40 @@ def main() -> int:
         Klay[l] = K
         stride[l] = align_up(614_400 * K + 19_216)  # the +16 tail word (31-B §1)
 
-    # ---- experts.bin ----
-    off = 0
-    with open(out / "experts.bin", "wb") as fh:
-        for l in layers:
-            for e in range(N_EXPERT):
-                pre = f"model.language_model.layers.{l}.mlp.experts.{e}."
-                blob = bytearray()
-                mul1s = []
-                for r in ROLES:
-                    for part in ("trellis", "suh", "svh"):
-                        blob += s.raw(pre + r + "." + part)
-                    b = s.raw(pre + r + ".mul1")
-                    dt, shp = s.loc[pre + r + ".mul1"][3:5]
-                    assert dt == "I32" and shp == () and len(b) == 4, f"{pre}{r}.mul1 {dt} {shp}"
-                    mul1s.append(struct.unpack("<i", b)[0])
-                blob += struct.pack("<4i", *mul1s, 0)
-                assert len(blob) == 614_400 * Klay[l] + 19_216, f"L{l} E{e} {len(blob)}"
-                fh.write(bytes(blob) + b"\x00" * (stride[l] - len(blob)))
-                off += stride[l]
-            if l % 12 == 0 or l == layers[-1]:
-                print(f"experts.bin: layer {l} written, {off / 2**30:.2f} GiB", flush=True)
-    total_experts = off
-
-    # ---- native_experts.txt v6 (written after its data, before the manifest) ----
-    with open(out / "native_experts.txt", "w") as fh:
-        fh.write("# strata native experts v6: layer gu_type d_type offset blob_bytes K "
-                 "(exl3; 200 = kTypeEXL3; offsets in this pack's experts.bin; raw blob "
-                 f"= 614,400*K + 19,216 padded to {ALIGN} B; n_expert {N_EXPERT}, total {total_experts})\n")
+    if not a.dense_only:
+        # ---- experts.bin ----
         off = 0
-        for l in layers:
-            fh.write(f"{l} {K_TYPE_EXL3} {K_TYPE_EXL3} {off} {stride[l]} {Klay[l]}\n")
-            off += stride[l] * N_EXPERT
-        assert off == total_experts
+        with open(out / "experts.bin", "wb") as fh:
+            for l in layers:
+                for e in range(N_EXPERT):
+                    pre = f"model.language_model.layers.{l}.mlp.experts.{e}."
+                    blob = bytearray()
+                    mul1s = []
+                    for r in ROLES:
+                        for part in ("trellis", "suh", "svh"):
+                            blob += s.raw(pre + r + "." + part)
+                        b = s.raw(pre + r + ".mul1")
+                        dt, shp = s.loc[pre + r + ".mul1"][3:5]
+                        assert dt == "I32" and shp == () and len(b) == 4, f"{pre}{r}.mul1 {dt} {shp}"
+                        mul1s.append(struct.unpack("<i", b)[0])
+                    blob += struct.pack("<4i", *mul1s, 0)
+                    assert len(blob) == 614_400 * Klay[l] + 19_216, f"L{l} E{e} {len(blob)}"
+                    fh.write(bytes(blob) + b"\x00" * (stride[l] - len(blob)))
+                    off += stride[l]
+                if l % 12 == 0 or l == layers[-1]:
+                    print(f"experts.bin: layer {l} written, {off / 2**30:.2f} GiB", flush=True)
+        total_experts = off
+
+        # ---- native_experts.txt v6 (written after its data, before the manifest) ----
+        with open(out / "native_experts.txt", "w") as fh:
+            fh.write("# strata native experts v6: layer gu_type d_type offset blob_bytes K "
+                     "(exl3; 200 = kTypeEXL3; offsets in this pack's experts.bin; raw blob "
+                     f"= 614,400*K + 19,216 padded to {ALIGN} B; n_expert {N_EXPERT}, total {total_experts})\n")
+            off = 0
+            for l in layers:
+                fh.write(f"{l} {K_TYPE_EXL3} {K_TYPE_EXL3} {off} {stride[l]} {Klay[l]}\n")
+                off += stride[l] * N_EXPERT
+            assert off == total_experts
 
     # ---- dense.bin + exl3_dense.txt + index.txt (C6.0: canonical names + engine forms, 46) ----
     grouped: dict[str, dict] = {}
@@ -353,7 +437,7 @@ def main() -> int:
                 if form == "shape":  # token_embd: embd.gguf carries it; iq3_s-style shape-only row
                     idxrows.append((cname, 0, 0, 0, pool, 0, 2560, 248320, 8, 32))
                     continue
-                b, form = convert_form(b, dt, form)
+                b = encode_form(canon_transform(cname, decode_raw(b, dt), shp), form)
                 off_ = wr(b)
                 if cname.endswith(("ssm_conv1d.weight", "ple_conv1d.weight")):
                     assert len(shp) == 3 and shp[1] == 1 and shp[2] == 4, f"{base}: conv {shp}"
@@ -382,9 +466,12 @@ def main() -> int:
                 t = wr(tr[:, 32:, :].tobytes()); sk = wr(suh); vk = wr(svh[2 * 512:])
                 side.append(f"{cname}.k_proj.weight {ki * 16} 128 {K} 2 {t} {sk} {vk} {mul1}")
                 continue
+            tr = np.frombuffer(s.raw(parts["trellis"]), "<u2").reshape(ki, nj, words)
+            tr, suh_b, svh_b = exl3_reorder(cname, tr, s.raw(parts["suh"]), s.raw(parts["svh"]))
             offs = {}
-            for p in ("trellis", "suh", "svh"):
-                offs[p] = wr(s.raw(parts[p]))
+            offs["trellis"] = wr(tr.tobytes())
+            offs["suh"] = wr(suh_b)
+            offs["svh"] = wr(svh_b)
             side.append(f"{cname} {ki * 16} {nj * 16} {K} 2 {offs['trellis']} {offs['suh']} "
                         f"{offs['svh']} {mul1}")
         fh.truncate(pool)
@@ -403,14 +490,15 @@ def main() -> int:
         for (name, kind, so, sb, do, db, ne0, ne1, cbits, g) in idxrows:
             fh.write(f"{name} 0 {kind} {so} {sb} {do} {db} {ne0} {ne1} {cbits} 0 {g} 0 0 0 0 0 0 0\n")
 
-    # ---- ngram copy (byte-for-byte; hybrid consumption, runtime mmap) ----
-    shutil.copyfile(src / ngram_file, out / ngram_file)
-    ng_meta = s.headers[ngram_file]["meta"] or {}
-    assert ng_meta.get("format") == "exl3_ngram_trellis", f"ngram format {ng_meta}"
+    if not a.dense_only:
+        # ---- ngram copy (byte-for-byte; hybrid consumption, runtime mmap) ----
+        shutil.copyfile(src / ngram_file, out / ngram_file)
+        ng_meta = s.headers[ngram_file]["meta"] or {}
+        assert ng_meta.get("format") == "exl3_ngram_trellis", f"ngram format {ng_meta}"
 
-    # ---- metadata.gguf carrier ----
-    n_tensors, n_kv = gguf_meta_copy(a.gguf_meta, out / "metadata.gguf")
-    print(f"metadata.gguf: n_tensors {n_tensors} -> 0, KV {n_kv} records copied verbatim")
+        # ---- metadata.gguf carrier ----
+        n_tensors, n_kv = gguf_meta_copy(a.gguf_meta, out / "metadata.gguf")
+        print(f"metadata.gguf: n_tensors {n_tensors} -> 0, KV {n_kv} records copied verbatim")
 
     # ---- manifest.json LAST (completion marker) ----
     man = {"tool": "tools/exl3/pack_exl3.py v2 (46: canonical vocab)", "src": src.name, "counts": cnt,
