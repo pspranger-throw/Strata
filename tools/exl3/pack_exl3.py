@@ -500,6 +500,15 @@ def main() -> int:
         n_tensors, n_kv = gguf_meta_copy(a.gguf_meta, out / "metadata.gguf")
         print(f"metadata.gguf: n_tensors {n_tensors} -> 0, KV {n_kv} records copied verbatim")
 
+    # ---- tokenizer/ dir (46, 2026-11-07): serve/server.py reads <pack>/tokenizer/, and the
+    # engine never opens the weight shards for it.  Extract from metadata.gguf: it carries the
+    # canonical recut vocab, so the dir and the pack's ids can never drift (the missing dir is
+    # what the first exl3 serve probe caught).
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    import strata_tokenizer
+    tk_cfg = strata_tokenizer.extract(out / "metadata.gguf", out)
+    print(f"tokenizer/: vocab {tk_cfg['vocab_size']}, merges {tk_cfg['n_merges']}, pre {tk_cfg['pre']}")
+
     # ---- manifest.json LAST (completion marker) ----
     man = {"tool": "tools/exl3/pack_exl3.py v2 (46: canonical vocab)", "src": src.name, "counts": cnt,
            "layers": len(layers), "n_expert": N_EXPERT, "align": ALIGN,
