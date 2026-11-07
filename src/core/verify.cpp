@@ -1117,13 +1117,20 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
-    {   // exl3-native (44 review round 2): the vendored win kernels keep a per-(device, stream) Scratch that
-        // refuses a stream FIRST SEEN inside graph capture, and verify captures its windows - allocate now.
+    {   // exl3-native (44 review round 2 + C6.2 review FATAL-1): the vendored kernels keep a
+        // per-(device, stream) Scratch that refuses a stream FIRST SEEN inside graph capture, and
+        // verify captures its windows - every stream a vendored mv/gemm can run on must be prepared
+        // NOW: cs_, sh_cs_ (the shared-expert fork carries dense 200 mv), the df branch streams and
+        // the mixer's side streams (the indexer mv arms run there).
         const auto& elay = strata::kernels::cpu::expert_layout();
         bool exl3_pack = false;
         for (size_t i = 0; !exl3_pack && elay.native && i < elay.fmt.size(); ++i)
             exl3_pack = elay.fmt[i].gu_type == strata::kernels::cpu::kExl3Fmt;
-        if (exl3_pack) strata::kernels::native_expert_exl3_prepare(cs_);
+        exl3_scratch_pack_ = exl3_pack;
+        if (exl3_pack) {
+            strata::kernels::native_expert_exl3_prepare(cs_);
+            strata::kernels::native_expert_exl3_prepare(sh_cs_);
+        }
     }
     if (cudaEventCreateWithFlags(&commit_done_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
@@ -1141,6 +1148,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             for (int i = 0; i < 2 && okb; ++i)
                 okb = cudaStreamCreateWithFlags(&df_side_[i], cudaStreamNonBlocking) == cudaSuccess &&
                       cudaEventCreateWithFlags(&df_join_[i], cudaEventDisableTiming) == cudaSuccess;
+            if (okb && exl3_scratch_pack_)   // C6.2 review FATAL-1: the indexer mv arms run on these
+                for (int i = 0; i < 2; ++i) strata::kernels::native_expert_exl3_prepare(df_side_[i]);
             if (!okb) { cudaGetLastError(); df_branch_ = false; }
         }
     }
@@ -1175,6 +1184,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaEventCreateWithFlags(&pjoin_, cudaEventDisableTiming) != cudaSuccess)) {
         err = "verify: the mixer branch's stream / events could not be created";
         return false;
+    }
+    if (exl3_scratch_pack_) {   // C6.2 review FATAL-1: prepare the mixer branch streams too
+        if (side_ != nullptr) strata::kernels::native_expert_exl3_prepare(side_);
+        if (side2_ != nullptr) strata::kernels::native_expert_exl3_prepare(side2_);
     }
     // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)

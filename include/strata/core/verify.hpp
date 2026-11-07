@@ -594,6 +594,7 @@ private:
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
+    bool exl3_scratch_pack_ = false;   // exl3-native pack: vendored mv/gemm scratch must be prepared per stream (C6.2 review FATAL-1)
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches
     // on these side streams (record_window); the same kernels on the same inputs, only their order is freer

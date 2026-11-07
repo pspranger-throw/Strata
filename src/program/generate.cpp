@@ -3870,6 +3870,14 @@ int main(int argc, char** argv) {
         }
         std::fclose(ef);
     }
+    // 46 (C6.2 review FATAL-2): the exl3 provider publishes ONE stage's table; a --layer-split run
+    // would load stage tables whose kind-Exl3 refs have no native views, and the dense consumers
+    // would reach null planes.  Per-stage providers are follow-up work; refuse the shape at boot.
+    if (exl3_native_pack && !split_devs.empty()) {
+        std::fprintf(stderr, "strata generate: %s is exl3-native: --layer-split is not supported yet "
+                             "(the exl3 dense provider serves one stage); run it on one GPU\n", o.pack.c_str());
+        return 2;
+    }
     if (!o.native_preset.empty()) {
         try {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
@@ -4483,6 +4491,18 @@ int main(int argc, char** argv) {
     }
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
+        // C6.2 review W-1: an exl3-native pack's token embedding rides its own embd.gguf carrier
+        // (the --native shard is metadata-only); default it, and refuse loudly when it is absent -
+        // NativeEmbed against a metadata carrier would fail later with a confusing message.
+        if (exl3_native_pack && o.embd_gguf.empty()) {
+            const std::string cand = o.pack + "/embd.gguf";
+            if (std::FILE* emb = std::fopen(cand.c_str(), "rb")) { std::fclose(emb); o.embd_gguf = cand; }
+            else {
+                std::fprintf(stderr, "strata generate: %s: no embd.gguf in the pack and no --embd-gguf: "
+                                     "the token embedding has no carrier\n", o.pack.c_str());
+                return 1;
+            }
+        }
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
             (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
             std::fprintf(stderr, "strata generate: %s is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) "
