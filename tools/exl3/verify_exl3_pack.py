@@ -381,8 +381,8 @@ def main() -> int:
             # through canon46 (the verifier's own rule copy) instead of matching v1 HF names.
             dsider2 = {f_[0]: f_ for f_ in dlines}
             for base_, parts_ in groups.items():
-                if not parts_ or base_ not in dense_src:
-                    continue
+                if not parts_:                              # plain groups: no exl3 parts (base names
+                    continue                                 # are NOT in the header map — only part keys are)
                 cname, form_ = canon46(base_)
                 if form_ != "exl3" or not (cname == "output.weight"
                                            or cname.endswith(".ffn_gate_shexp.weight")):
