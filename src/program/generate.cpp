@@ -891,6 +891,11 @@ struct Options {
     /// the batched path)
     int64_t short_read = 64;
     bool prefill_head_alias = false;   // lend the native output head's VRAM to prompt buffers between request phases
+    /// --mtp-head-draft-only: the native head (--native-head-gguf) is bound only to source the MTP draft head's
+    /// vocabulary subset (its rows are gathered into the drafter's own table at bind); the head itself is then
+    /// released, and the canonical/pack head (exl3's K6 provider row) keeps serving every logit - the verify
+    /// windows never receive the native head. exllamav3-style: the drafter's head and the target head are separate.
+    bool mtp_head_draft_only = false;
     /// --pipeline-windows N (--serve, a layer split on exactly two GPUs; opt-in): 1 = a prompt's short reads through
     /// the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1 reads window K);
     /// 2 = the decode windows too: stage 0 runs window K+1 speculatively while stage 1 verifies window K (rolled back
@@ -3261,6 +3266,7 @@ int main(int argc, char** argv) {
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
+        else if (a == "--mtp-head-draft-only") o.mtp_head_draft_only = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
@@ -4118,6 +4124,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
         return 2;
     }
+    if (o.mtp_head_draft_only) {
+        const char* full_head = std::getenv("STRATA_MTP_FULL_HEAD");
+        const char* why = o.mtp.empty() ? "it needs --mtp"
+                        : o.native_head_gguf.empty() ? "it needs --native-head-gguf (the draft head's source)"
+                        : o.prefill_head_alias ? "it does not combine with --prefill-head-alias"
+                        : (full_head != nullptr && full_head[0] == '1')
+                            ? "it does not work with STRATA_MTP_FULL_HEAD=1 (the draft would read the head itself)"
+                            : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: --mtp-head-draft-only is unavailable: %s\n", why);
+            return 2;
+        }
+    }
     // Plan v0.3 P6: where the experts live.  A native pack (tools/iq_pack.py: the IQ2_XS / IQ3_XXS files) keeps
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
@@ -4533,7 +4552,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        if (!o.native_head_gguf.empty()) skip.insert("output.weight");
+        // --mtp-head-draft-only keeps the pack's own output row in the arena: it is the head that answers.
+        if (!o.native_head_gguf.empty() && !o.mtp_head_draft_only) skip.insert("output.weight");
         // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         // #326: a --compat-bf16 pack (OrcaRouter IQ3_XXS) keeps its BF16 key in the arena
@@ -8037,7 +8057,7 @@ int main(int argc, char** argv) {
     mem_mark("the expert cache and the graphs");
     std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
     auto run_head = [&](void* stream) -> bool {
-        if (!native_head.loaded())
+        if (!native_head.loaded() || o.mtp_head_draft_only)
             return strata::core::lm_head(wt, g, ss.block, d_logits, stream, err);
         return strata::core::lm_head_mix(wt, g, ss.block, stream, err) &&
                native_head.run(ss.block.mixed, d_logits, stream, err);
@@ -10187,7 +10207,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
+                    ok_s = ver_same.init(wt, g, ss, vh, (native_head.loaded() && !o.mtp_head_draft_only) ? &native_head : nullptr, std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
@@ -10272,7 +10292,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+            if (!ver_b.init(wt, g, ss, vh, (native_head.loaded() && !o.mtp_head_draft_only) ? &native_head : nullptr, o.spec, err)) {
                 std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA0 (the first card): "
                                      "%s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
                 return 1;
@@ -10283,7 +10303,7 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
+        if (!ver.init(wt, g, ss, vh, ((native_head.loaded() || prefill_head_alias_bound) && !o.mtp_head_draft_only) ? &native_head : nullptr,
                       batch_max_t(), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
@@ -10315,6 +10335,13 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+        }
+        if (o.mtp_head_draft_only && native_head.loaded()) {
+            // every drafter (solo + batch slots) has gathered its draft-vocab subset from the native head; the
+            // captured verifier graphs were built without it, so release it: the pack head carries the logits.
+            native_head.unload();
+            std::fprintf(stderr, "strata serve: --mtp-head-draft-only: the native output head is released after "
+                                 "the draft subsets; the pack's own head serves the logits\n");
         }
         // each stage's verifier gets its stage's slot sessions
         if (o.batch > 0) {
@@ -18344,6 +18371,11 @@ int main(int argc, char** argv) {
         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        if (o.mtp_head_draft_only && native_head.loaded()) {
+            native_head.unload();
+            std::fprintf(stderr, "strata generate: --mtp-head-draft-only: the native output head is released after "
+                                 "the draft subsets; the pack's own head serves the logits\n");
         }
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2 && !ver.tapping()) {
