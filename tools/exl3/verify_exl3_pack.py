@@ -377,17 +377,24 @@ def main() -> int:
                 check(np.array_equal(w_src, w_pk),
                       f"decode parity L{l} E{e} gate K{K} bit-exact {w_src.shape}")
         with open(pack / "dense.bin", "rb") as df:
-            for f_ in dlines:
-                name = f_[0]
-                if not (name.startswith("lm_head") or name.endswith("shared_expert.gate_proj")):
+            # 46: dense sidecar rows carry CANONICAL names now — walk source groups and map them
+            # through canon46 (the verifier's own rule copy) instead of matching v1 HF names.
+            dsider2 = {f_[0]: f_ for f_ in dlines}
+            for base_, parts_ in groups.items():
+                if not parts_ or base_ not in dense_src:
                     continue
-                w_src = exl3.reconstruct_weight(raw.np(name + ".trellis"), raw.np(name + ".suh"),
-                                                raw.np(name + ".svh"), CB_MUL1)
-                tr = Region(df, int(f_[5]), name + ".trellis").a
-                su = Region(df, int(f_[6]), name + ".suh").a
-                sv = Region(df, int(f_[7]), name + ".svh").a
+                cname, form_ = canon46(base_)
+                if form_ != "exl3" or not (cname == "output.weight"
+                                           or cname.endswith(".ffn_gate_shexp.weight")):
+                    continue
+                f_ = dsider2[cname]
+                w_src = exl3.reconstruct_weight(raw.np(parts_["trellis"]), raw.np(parts_["suh"]),
+                                                raw.np(parts_["svh"]), CB_MUL1)
+                tr = Region(df, int(f_[5]), parts_["trellis"]).a
+                su = Region(df, int(f_[6]), parts_["suh"]).a
+                sv = Region(df, int(f_[7]), parts_["svh"]).a
                 w_pk = exl3.reconstruct_weight(tr, su, sv, CB_MUL1)
-                check(np.array_equal(w_src, w_pk), f"decode parity dense {name} K{f_[3]} bit-exact {w_src.shape}")
+                check(np.array_equal(w_src, w_pk), f"decode parity dense {cname} K{f_[3]} bit-exact {w_src.shape}")
 
     print("FAILURES:", len(fails))
     return 1 if fails else 0
