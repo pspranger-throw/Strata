@@ -5503,11 +5503,13 @@ bool native_expert_grouped_exl3(const NativeExpertLayout& L, const unsigned long
                               // vendored grp_ent convention) and part[e] lands on the row the combine reads
     w.plan_ptr = nullptr;     // parts mode: the kernels do not combine; verify weights the entries from w_
     w.x = x_f32;
-    w.x_stride = (size_t) L.n_embd * 4;
+    w.x_stride = (size_t) L.n_embd;   // KWin.x is a float*: rows are n_embd FLOATS apart (the *4 byte-unit
+                                      // convention of the q8_1 window paths was a 4x stride bug: only entry
+                                      // token 0 read real data, every other row read past the mixed_ rows)
     w.h = (float*) scratch;   // h rows are numbered by grp_ent values, all below T * route_k
     w.part = parts_out;
     w.out = parts_out;        // parts mode never reads out; the vendored guard wants it non-null
-    w.out_stride = (size_t) L.n_embd * 4;
+    w.out_stride = (size_t) L.n_embd;   // same float* units rule as x_stride
     w.limit = 0.0f;           // flash-next's FFN is plain swiglu (the IQ window path applies no clamp either)
     w.T = (int) T;
     w.k = route_k;
