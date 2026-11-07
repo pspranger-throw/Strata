@@ -28,6 +28,8 @@ ALIGN = 64
 ROLES = ("gate_proj", "up_proj", "down_proj")
 NP_DTYPE = {"I16": "<i2", "F16": "<f2", "I32": "<u4"}
 
+import pack_exl3 as PB  # canonical layout transforms (46 G0-v3a): single source of truth with the builder
+
 
 def align_up(x: int, a: int = ALIGN) -> int:
     return (x + a - 1) // a * a
@@ -111,6 +113,11 @@ def main() -> int:
     ap.add_argument("--ref-tools", type=pathlib.Path, default=None,
                     help="directory containing the fork's exl3 numpy package; decode parity skipped if absent")
     ap.add_argument("--sample", type=int, default=4, help="expert decodes per K class")
+    ap.add_argument("--ref-pack", type=pathlib.Path, default=None,
+                    help="production pack for the kind-0 cross-pack cos sweep (46 G0-v3b)")
+    ap.add_argument("--gdn-gguf", type=pathlib.Path, default=None,
+                    help="same-architecture GGUF for the GDN dequant cos spot-check (46 G0-v3c)")
+    ap.add_argument("--gdn-layers", type=int, default=2, help="GDN layers for v3c (0 = skip)")
     a = ap.parse_args()
     src, pack = a.src, a.pack
     raw = Raw(src)
@@ -300,12 +307,26 @@ def main() -> int:
             if f2 is None:
                 n_bad += 1
                 continue
+            if cname.endswith(("attn_qkv.weight", "attn_gate.weight", "ssm_out.weight")):
+                # GDN V-head layout (46 G0-v3a): trellis tiles + suh/svh arrive permuted.
+                k_, n_, K_ = int(f2[1]), int(f2[2]), int(f2[3])
+                trs = np.frombuffer(raw[parts["trellis"]], "<u2").reshape(k_ // 16, n_ // 16, 16 * K_)
+                trs, suhb, svhb = PB.exl3_reorder(cname, trs, raw[parts["suh"]], raw[parts["svh"]])
+                if at(f2[5], trs.nbytes) != trs.tobytes():
+                    n_bad += 1
+                if at(f2[6], len(suhb)) != suhb:
+                    n_bad += 1
+                if at(f2[7], len(svhb)) != svhb:
+                    n_bad += 1
+                if int(f2[8]) != struct.unpack("<i", raw[parts["mul1"]])[0]:
+                    n_bad += 1
+                continue
             for part, col in (("trellis", 5), ("suh", 6), ("svh", 7)):
                 if at(f2[col], len(raw[parts[part]])) != raw[parts[part]]:
                     n_bad += 1
             if int(f2[8]) != struct.unpack("<i", raw[parts["mul1"]])[0]:
                 n_bad += 1
-    check(n_bad == 0, f"exl3_dense every region incl split ({n_bad} bad fields)")
+    check(n_bad == 0, f"exl3_dense every region incl split + GDN reorder ({n_bad} bad fields)")
     ilines = [l.split() for l in (pack / "index.txt").read_text().splitlines()
               if l and not l.startswith("#")]
     isider = {f_[0]: f_ for f_ in ilines}
@@ -324,14 +345,16 @@ def main() -> int:
                     n_bad += 1
                     print(f"  shape row wrong: {cname} fields {f2[9]}/{f2[11]}")
                 continue
-            want = conv46(raw[base], raw.tmap[base][0], form)
+            # transform-aware (46 G0-v3a): V-head reorders, ssm_a=-exp(A_log), +1 gammas
+            dt46, shp46 = raw.tmap[base][0], raw.tmap[base][1]
+            want = PB.encode_form(PB.canon_transform(cname, PB.decode_raw(raw[base], dt46), shp46), form)
             df.seek(int(f2[3]))
             got = df.read(len(want))
             if got != want:
                 n_bad += 1
                 print(f"  index byte mismatch: {base} -> {cname} (src dtype {raw.tmap[base][0]}, "
                       f"form {form}, {len(want)} B)")
-    check(n_bad == 0, f"index rows every byte incl form conversion ({n_bad} bad)")
+    check(n_bad == 0, f"index rows every byte incl form conversion + canonical layout (46 G0-v3a) ({n_bad} bad)")
     check(len(ilines) == sum(1 for p_ in groups.values() if not p_),
           f"index rows == source plain tensors ({len(ilines)})")
 
@@ -395,6 +418,97 @@ def main() -> int:
                 sv = Region(df, int(f_[7]), parts_["svh"]).a
                 w_pk = exl3.reconstruct_weight(tr, su, sv, CB_MUL1)
                 check(np.array_equal(w_src, w_pk), f"decode parity dense {cname} K{f_[3]} bit-exact {w_src.shape}")
+
+    # ---- 46 G0-v3 (2026-11-07): independent layout anchors ----
+    # (b) cross-pack cos sweep vs the production pack (catches transform-logic regressions
+    #     the byte recompute cannot); (c) GDN exl3 matrices dequant-compared against the
+    #     same GGUF tensors.  The byte-exact transform-aware recompute lives in the two
+    #     upgraded byte stages above (46 G0-v3a).
+    if a.ref_pack is not None and (a.ref_pack / "index.txt").exists():
+        ridx = {f_[0]: (int(f_[2]), int(f_[3]), int(f_[4]))
+                for f_ in (l.split() for l in (a.ref_pack / "index.txt").read_text().splitlines()
+                           if l and not l.startswith("#"))}
+
+        def as_view(b42, typ):
+            if typ == 2:
+                return b42.view(np.float32)
+            if typ == 4:
+                return (b42.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+            if typ == 5:
+                return b42.view(np.uint16).view(np.float16).astype(np.float32)
+            return None
+        n_c = n_cbad = 0
+        with open(a.ref_pack / "dense.bin", "rb") as rf, open(pack / "dense.bin", "rb") as df:
+            for f_ in ilines:
+                name, typ = f_[0], int(f_[2])
+                if int(f_[1]) != 0 or typ not in (2, 4, 5) or name not in ridx:
+                    continue
+                t2, io, il = ridx[name]
+                if t2 != typ or il != int(f_[4]):
+                    n_cbad += 1
+                    print("  (type/len differ: %s)" % name, flush=True)
+                    continue
+                df.seek(int(f_[3]))
+                x = as_view(np.frombuffer(df.read(int(f_[4])), np.uint8), typ)
+                rf.seek(io)
+                y = as_view(np.frombuffer(rf.read(il), np.uint8), typ)
+                n_c += 1
+                c = float(np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-30))
+                if c < 0.999 or not np.isfinite(x).all():
+                    n_cbad += 1
+                    print("  (cross-pack cos %.4f: %s)" % (c, name), flush=True)
+        check(n_cbad == 0, f"kind-0 cross-pack layout vs {a.ref_pack.name}: {n_c} rows, "
+                           f"{n_cbad} suspicious (46 G0-v3b)")
+    else:
+        print("  skip kind-0 cross-pack sweep (no --ref-pack)")
+    if a.ref_tools is not None and a.gdn_gguf is not None and a.gdn_gguf.exists() and a.gdn_layers > 0:
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+        import gguf_reader as G
+        from _paths import add_gguf_py
+        add_gguf_py()
+        import gguf.quants as qq
+        g = G.GGUFFile(str(a.gdn_gguf))
+        GT = {tt.name: tt for tt in g.tensors}
+        n_l = n_gbad = 0
+        with open(pack / "dense.bin", "rb") as df:
+            for l in range(48):
+                if n_l >= a.gdn_layers:
+                    break
+                nm0 = f"blk.{l}.attn_qkv.weight"
+                if nm0 not in dsider:
+                    continue   # full-attention layer: no GDN rows
+                n_l += 1
+                for nm in (nm0, f"blk.{l}.attn_gate.weight", f"blk.{l}.ssm_out.weight"):
+                    f_ = dsider[nm]
+                    k_, n_, K_ = int(f_[1]), int(f_[2]), int(f_[3])
+                    df.seek(int(f_[5]))
+                    tr = np.frombuffer(df.read((k_ // 16) * (n_ // 16) * 32 * K_), "<u2") \
+                        .reshape(k_ // 16, n_ // 16, 16 * K_)
+                    df.seek(int(f_[6]))
+                    su = np.frombuffer(df.read(2 * k_), "<f2")
+                    df.seek(int(f_[7]))
+                    sv = np.frombuffer(df.read(2 * n_), "<f2")
+                    Wp = exl3.reconstruct_weight(tr, su, sv, CB_MUL1)
+                    tt = GT.get(nm)
+                    if tt is None:
+                        n_gbad += 1
+                        print("  (GGUF tensor missing: %s)" % nm, flush=True)
+                        continue
+                    nel = int(np.prod(tt.shape))
+                    qb, qe = qq.GGML_QUANT_SIZES[int(tt.type_id)]
+                    qb, qe = (qb, qe) if qb < qe else (qe, qb)
+                    with open(a.gdn_gguf, "rb") as gf:
+                        gf.seek(g.data_start + tt.offset)
+                        qbytes = np.frombuffer(gf.read(qb * nel // qe), np.uint8)
+                    Gm = qq.dequantize(qbytes, tt.type_id).astype(np.float32)
+                    # orientation-safe: pack flat vs GGUF flat, either transpose (the families
+                    # differ); a correct reorder scores ~1.0 in ONE orientation, < 0.5 in none.
+                    c = max(float(np.dot(v, Gm) / (np.linalg.norm(v) * np.linalg.norm(Gm) + 1e-30))
+                            for v in (Wp.ravel(), Wp.T.ravel()))
+                    if c < 0.995:
+                        n_gbad += 1
+                    print(f"  {'ok   ' if c >= 0.995 else 'FAIL '}GDN {nm} vs GGUF dequant cos {c:.4f}", flush=True)
+        check(n_gbad == 0, f"GDN exl3 vs GGUF dequant, {n_l} layers: {n_gbad} below 0.995 (46 G0-v3c)")
 
     print("FAILURES:", len(fails))
     return 1 if fails else 0
