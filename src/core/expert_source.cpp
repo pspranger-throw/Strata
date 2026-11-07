@@ -4967,6 +4967,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // pinned (the fetch below checks), else it stays a CPU miss exactly as before.  Read once.
         static const bool pcie_min1 = [] { const char* v = std::getenv("STRATA_PCIE_MIN1"); return v && std::atoi(v) != 0; }();
         if (pcie_min1 && pcie_ok && m < 1 && nmiss >= 2) m = 1;
+        // exl3 (200) pack (46, 2026-11-07): the CPU lane has NO row kernels for these blobs —
+        // native_gu_rows/native_down_rows refuse loudly (exit 1), a scheduling fault, not a fallback.
+        // A verify window that misses on such a layer must stream EVERY miss to the GPU: the share is
+        // forced full, whatever the bandwidth model picked.  (serve's window lanes keep their own caps;
+        // the verifier sizes its staging for this — verify.cpp's kStagingBlobs widened for exl3 layouts.)
+        if (pcie_ok && (lay.fmt[(size_t) d.layers].gu_type == strata::kernels::cpu::kExl3Fmt ||
+                        lay.fmt[(size_t) d.layers].d_type == strata::kernels::cpu::kExl3Fmt))
+            m = nmiss;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];

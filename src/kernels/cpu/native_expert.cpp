@@ -18,6 +18,9 @@
 
 #include <algorithm>
 #include <cmath>
+#ifdef __linux__
+#include <execinfo.h>   // 46 diag: backtrace() at the exl3 CPU-lane refusal
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -404,13 +407,26 @@ int native_gu_mt_min(int gu_type) {
     return iq3s_one && gu_type == 21 ? 1 : mt_min;
 }
 
+// 46 diag (2026-11-07): an exl3 (200) expert that reaches the CPU lane is a scheduling fault — serve never
+// queues these on purpose.  Print the caller chain before the refusal's exit, so a live crash names the lane
+// that queued the job (STRATA_CKPT_LAYERS pattern: a committed diagnostic, not a behavior change).
+static void exl3_cpu_lane_bt(const char* what) {
+    std::fprintf(stderr, "%s: exl3 (200) experts have no CPU row kernels\n", what);
+#ifdef __linux__
+    void* frames[40];
+    int n = backtrace(frames, 40);
+    std::fprintf(stderr, "%s: caller chain (%d frames):\n", what, n);
+    backtrace_symbols_fd(frames, n, 2);
+#endif
+}
+
 template <NativeArithmetic Arithmetic>
 void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
     // exl3 (200) blobs have no CPU row kernels yet: ggml's type table would be read out of range at 200
     // (GGML_TYPE_COUNT = 43).  Loud refusal, never a garbage dot product; the win-kernel path is GPU-side.
     if (f.gu_type == kExl3Fmt || f.d_type == kExl3Fmt) {
-        std::fprintf(stderr, "native_gu_rows: exl3 (200) experts have no CPU row kernels\n");
+        exl3_cpu_lane_bt("native_gu_rows");
         std::exit(1);
     }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
@@ -560,7 +576,7 @@ template <NativeArithmetic Arithmetic>
 void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
     if (f.gu_type == kExl3Fmt || f.d_type == kExl3Fmt) {   // as in native_gu_rows_impl: no CPU kernels for 200
-        std::fprintf(stderr, "native_down_rows: exl3 (200) experts have no CPU row kernels\n");
+        exl3_cpu_lane_bt("native_down_rows");
         std::exit(1);
     }
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
