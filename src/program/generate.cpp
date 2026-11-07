@@ -83,6 +83,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #endif
 #include "strata/core/native_dense.hpp"
+#include "strata/core/exl3_dense.hpp"
 #include "strata/program/adapt_decay.hpp"
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
@@ -3850,6 +3851,25 @@ int main(int argc, char** argv) {
         if (n > 0 && n < o.adapt_every && wr > 0) { o.adapt_warm_every = n; o.adapt_warm_rounds = wr; }
     }
     strata::core::layer_set_shared_early(!o.shared_late);
+    // 46: exl3-native packs (fmt-200 expert rows) carry their dense linears in the pack itself -
+    // regions of dense.bin named by exl3_dense.txt, which the arena loader synthesizes as kind
+    // Exl3 rows and the Exl3Dense provider publishes after the load.  The --native GGUF for such
+    // a pack is a metadata-only carrier: the preset block must NOT default the GGUF-fed services
+    // (NativeDense projections, NativeHead, the native PLE key) for it.  expert_layout_load runs
+    // later (:4094-era), so probe the table's type column here, cheaply and independently.
+    bool exl3_native_pack = false;
+    if (std::FILE* ef = std::fopen((o.pack + "/native_experts.txt").c_str(), "rb")) {
+        char eline[256];
+        while (std::fgets(eline, sizeof eline, ef)) {
+            if (eline[0] == '#') continue;
+            long long el = -1, egu = -1;
+            if (std::sscanf(eline, "%lld %lld", &el, &egu) == 2 && egu == strata::kernels::cpu::kExl3Fmt) {
+                exl3_native_pack = true;
+                break;
+            }
+        }
+        std::fclose(ef);
+    }
     if (!o.native_preset.empty()) {
         try {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
@@ -3886,8 +3906,12 @@ int main(int argc, char** argv) {
         o.native_bf16 = o.native_bf16_extra = true;
         o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
-        if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
-        if (o.native_dense_gguf.empty()) {
+        // 46: an exl3-native pack has no GGUF-fed services: ple_key stays a canonical BF16 row of
+        // the arena, output.weight is one of the sidecar linears (the exl3 provider publishes it),
+        // and NativeDense has nothing to load from a metadata-only carrier.
+        if (exl3_native_pack) o.native_ple_key = false;
+        if (!exl3_native_pack && o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
+        if (!exl3_native_pack && o.native_dense_gguf.empty()) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
             // may put any layer in any shard (Swift's GGUFs: layers 13-47 in shard 2, the PLE table in shard 1)
             o.native_dense_gguf = o.native_shards;
@@ -4633,6 +4657,26 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights, in %.1f s\n",
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
+    }
+    // 46: the exl3-native pack's dense linears: the arena loader synthesized their rows (kind Exl3,
+    // force-skipped - no canonical bytes), and this provider uploads each dense.bin region and
+    // publishes native_type 200 + a stable descriptor on the reference.  Every consumer of one of
+    // these names takes an exl3 arm (45's inventory; boot sweep refuses any name without one).
+    // Single stage for now: all regions resident.  Keep the provider alive for the whole session.
+    strata::core::Exl3Dense exl3_dense;
+    if (exl3_native_pack) {
+        if (!exl3_dense.load(o.pack, wt, err)) {
+            std::fprintf(stderr, "strata generate: exl3 dense linears: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: %zu exl3 dense linears, %.2f GiB of exl3 regions resident\n",
+                     exl3_dense.tensor_count(), (double) exl3_dense.weight_bytes() / 1073741824.0);
+        // HOLD (remove with the C6.2 arms + boot sweep): until EVERY sidecar name has an exl3
+        // consumer arm, an unwired consumer would read the descriptor pointer as device data and
+        // produce plausible garbage.  Everything BEFORE this line is exactly the boot path the
+        // smoke run wants to prove (carrier parse, arena synthesis, region upload).
+        std::fprintf(stderr, "strata generate: exl3 dense consumer arms (C6.2) are not in this build yet\n");
+        return 1;
     }
 
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
