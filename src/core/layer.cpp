@@ -59,7 +59,12 @@ uint64_t q8k_bytes(int64_t n) { return (uint64_t) (n / Q8K_ELEMS_PER_BLOCK) * Q8
 /// `s_gemv_q8k` takes the canonical-form attributes; a `WeightRef` carries them, and a tensor that is NOT
 /// quantized has none.  Returns false and names the tensor rather than building a form out of zeroes - which
 /// would decode every code as `0 + bias` and produce a perfectly finite wrong answer.
-bool sform_of(const WeightRef& r, strata::kernels::SForm& f, const std::string& name, std::string& err) {    if (!r.quantized()) {        err = name + " is not a quantized tensor, so it has no S-form";        return false;    }    f.code_bits = r.code_bits;    f.code_bias = r.code_bias;    f.group_elems = r.group_elems;    f.codebook = r.codebook_iq4nl ? strata::kernels::Codebook::Iq4Nl : strata::kernels::Codebook::Affine;    f.has_offset = r.has_offset;    f.act_kind = r.act_kind;
+bool sform_of(const WeightRef& r, strata::kernels::SForm& f, const std::string& name, std::string& err) {
+    // exl3-native packs (45/46): a kind-Exl3 row has no canonical bytes and no S-form - it exists so
+    // lookups find it, and the exl3 provider publishes native_type 200 on it.  Pass with a default
+    // form: only the CANONICAL branch ever reads f, and these refs have no canonical branch.
+    if (r.kind == WeightKind::Exl3) { f = strata::kernels::SForm{}; return true; }
+    if (!r.quantized()) {        err = name + " is not a quantized tensor, so it has no S-form";        return false;    }    f.code_bits = r.code_bits;    f.code_bias = r.code_bias;    f.group_elems = r.group_elems;    f.codebook = r.codebook_iq4nl ? strata::kernels::Codebook::Iq4Nl : strata::kernels::Codebook::Affine;    f.has_offset = r.has_offset;    f.act_kind = r.act_kind;
 // carried, not derived - see the note on `SForm::act_kind`
 return true;}
 /// The three canonical planes of a quantized tensor, located INSIDE the loaded region.
@@ -95,6 +100,10 @@ bool plane_ptrs(const WeightRef& r, const std::string& name, Planes& out, std::s
 // caller's choice and the two differ: an S2 tensor's activation contract is Q8_0 (`s2_gemv_q8`) while a
 // K-quant's is Q8_K (`s_gemv_q8k`).  This used to accept only 4 and 8, which refused `attn_q` - a Q2_0
 // tensor and the reason the QSA layer could not be composed at all.
+    // exl3-native packs (45/46): kind-Exl3 rows carry no planes (see sform_of); pass with empty
+    // ones - a consumer reaching the canonical branch on one of these would fault on null codes,
+    // which is the honest failure for a name whose exl3 arm is missing (never plausible garbage).
+    if (r.kind == WeightKind::Exl3) { out = Planes{}; return true; }
 if (r.code_bits != 2 && r.code_bits != 4 && r.code_bits != 8) {        err = name + ": code_bits " + std::to_string(r.code_bits) + " is not an S2/S4/S8 form";        return false;    }    const uint64_t end = r.codes_bytes + r.scales_bytes + r.offset_bytes;    if (r.codes_bytes == 0 || r.scales_bytes == 0 || end != r.bytes) {        char buf[320];        std::snprintf(buf, sizeof buf,                      "%s: the planes add up to %llu B but the tensor is %llu B (codes %llu, scales %llu, "                      "offsets %llu) - what the loader recorded is not the layout that was loaded",                      name.c_str(), (unsigned long long) end, (unsigned long long) r.bytes,                      (unsigned long long) r.codes_bytes, (unsigned long long) r.scales_bytes,                      (unsigned long long) r.offset_bytes);        err = buf;        return false;    }    if (r.has_offset != (r.offset_bytes != 0)) {        err = name + ": has_offset is " + std::to_string(r.has_offset ? 1 : 0) + " but the offset plane is " +              std::to_string(r.offset_bytes) + " B";        return false;    }    const uint8_t* base = (const uint8_t*) r.data;    out.codes = base;    out.scales = (const float*) (base + r.codes_bytes);    out.offset = r.offset_bytes ? (const float*) (base + r.codes_bytes + r.scales_bytes) : nullptr;    return true;}
 constexpr int TPR = 32;
 bool native_bf16_projections = false;
@@ -1145,7 +1154,8 @@ const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, 
 struct Req { const char* suf; };    const WeightRef* w_idxk = v.get("indexer.k_proj.weight");    const WeightRef* w_attnq = v.get("attn_q.weight");    const WeightRef* w_attnk = v.get("attn_k.weight");    const WeightRef* w_attnv = v.get("attn_v.weight");    const WeightRef* w_attno = v.get("attn_output.weight");    const WeightRef* w_idxq = v.get("indexer.q_proj.weight");    const WeightRef* w_qn = v.get("attn_q_norm.weight");    const WeightRef* w_kn = v.get("attn_k_norm.weight");    const WeightRef* w_iqn = v.get("indexer.q_norm.weight");    const WeightRef* w_ikn = v.get("indexer.k_norm.weight");    const char* missing = !w_idxk ? "indexer.k_proj.weight" : !w_attnq ? "attn_q.weight"                          : !w_attnk ? "attn_k.weight" : !w_attnv ? "attn_v.weight"                          : !w_attno ? "attn_output.weight" : !w_idxq ? "indexer.q_proj.weight"                          : !w_qn ? "attn_q_norm.weight" : !w_kn ? "attn_k_norm.weight"                          : !w_iqn ? "indexer.q_norm.weight" : !w_ikn ? "indexer.k_norm.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }    if (pos < 0 || pos >= st.max_cells) {        err = "qsa_layer: pos " + std::to_string(pos) + " is outside the state's 0.." +              std::to_string(st.max_cells - 1);        return false;    }
 // THE TWO BF16 PROJECTIONS: the arena holds them re-rounded to 2 B/elem, which is what `bf16_gemv` wants.
 // Reading one as f32 would walk 2x its length inside the arena without faulting.
-if (w_idxk->kind != WeightKind::Bf16InF32 || w_idxq->kind != WeightKind::Bf16InF32) {        err = v.name("indexer.*_proj.weight") + " must be engine form 1 (bf16); they are " +              std::to_string((int) w_idxk->kind) + " and " + std::to_string((int) w_idxq->kind);        return false;    }
+if ((w_idxk->kind != WeightKind::Bf16InF32 || w_idxq->kind != WeightKind::Bf16InF32) &&
+    (w_idxk->kind != WeightKind::Exl3 || w_idxq->kind != WeightKind::Exl3)) {        err = v.name("indexer.*_proj.weight") + " must be engine form 1 (bf16) or exl3-native (45/46); they are " +              std::to_string((int) w_idxk->kind) + " and " + std::to_string((int) w_idxq->kind);        return false;    }
 // ---- 1. the three activation formats, once each
 bool images_fused = false;
 #if defined(STRATA_EXPERIMENTAL_SM60)
@@ -1180,6 +1190,27 @@ if (!images_fused) {
         if (cudaMemcpyAsync(st.step, st.host_step, qsa_step_bytes(), cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(st.pos_dev, st.host_pos, (size_t) g.n_head * 4, cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess) {            err = "qsa_layer: the step-state upload failed";            return false;        }    }
 // ---- 3. the indexer's RAW key (and, with the V100 switch, its QUERY in the same kernel; was two launches)
 bool idx_pair = false;
+// exl3-native packs (45/46): the indexer q/k are kind-Exl3 refs (regions of dense.bin, no BF16
+// bytes to project).  Their outputs are already F32, so the arm is gemv_quantized's native branch:
+// quantize x once into the provider's shared q8_1 scratch and mv twice.  kind-Exl3 without
+// native_data is a provider bug: the empty planes would crash, so refuse it by name here.
+if (w_idxk->kind == WeightKind::Exl3) {
+    if (!w_idxk->native_data || !w_idxq->native_data) {
+        err = v.name("indexer.*_proj.weight") + ": exl3 refs published without native views";
+        return false;
+    }
+    SForm f_ik, f_iq;    Planes p_ik, p_iq;
+    if (!sform_of(*w_idxk, f_ik, v.name("indexer.k_proj.weight"), err)) return false;
+    if (!sform_of(*w_idxq, f_iq, v.name("indexer.q_proj.weight"), err)) return false;
+    if (!plane_ptrs(*w_idxk, v.name("indexer.k_proj.weight"), p_ik, err)) return false;
+    if (!plane_ptrs(*w_idxq, v.name("indexer.q_proj.weight"), p_iq, err)) return false;
+    if (!gemv_quantized(*w_idxk, p_ik, f_ik, nullptr, nullptr, b.idx_raw, g.n_embd, g.idx_key_dim,
+                        v.name("indexer.k_proj.weight"), stream, err, x)) return false;
+    if (!gemv_quantized(*w_idxq, p_iq, f_iq, nullptr, nullptr, b.q_idx, g.n_embd,
+                        g.idx_q_heads * g.idx_key_dim, v.name("indexer.q_proj.weight"), stream, err,
+                        x, w_idxk->native_q8_1 == w_idxq->native_q8_1)) return false;
+    idx_pair = true;   // both are computed: step 7's separate q projection must not re-read null bytes
+} else
 #if defined(STRATA_EXPERIMENTAL_SM60)
 if (strata::kernels::fuse_decode()) {
     // two BF16 projections of the same x in ONE kernel: the query is needed only at step 7 and nothing in between
@@ -1409,8 +1440,10 @@ bool lm_head(const WeightTable& tables, const ModelGeometry& g, const BlockBuffe
     }
     if (!lm_head_mix(tables, g, bb, stream, err)) return false;
     strata::kernels::quantize_q8_K(bb.mixed, bb.head_q8k, g.n_embd, stream);
+    // bb.mixed (the F32 head input) is unused on the canonical path and required by the native one
+    // (45/46: an exl3 output.weight mv quantizes it into the provider's shared q8_1 scratch).
     return gemv_quantized(*wo, planes, form, bb.head_q8k, bb.head_q8k, logits,
-                          g.n_embd, wo->ne1, "output.weight", stream, err);
+                          g.n_embd, wo->ne1, "output.weight", stream, err, bb.mixed);
 }
 // ================================ ONE WHOLE BLOCK ================================
 uint64_t block_buffers_bytes(const ModelGeometry& g) {    const strata::kernels::GrShapes s{g.n_embd, g.hc, g.hc_lr};    uint64_t n = 0;    n += (uint64_t) g.hc * g.n_embd * 4;

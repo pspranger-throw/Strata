@@ -2695,6 +2695,19 @@ bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y
                  std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
     const bool ct = g_cold.begin();
+    if (w->native_type == 200) {
+        // exl3-native packs (45/46): native_data is the provider's Exl3DenseDesc, and the vendored
+        // tensor-core gemm reads the trellis region directly - no dequant staging.  Same X operand
+        // (F16 rows) and stream as Gemm::native would use; the lds default to the dense layouts.
+        if (!strata::kernels::exl3_dense_gemm((const strata::kernels::Exl3DenseDesc*) w->native_data, X,
+                                              (int) (ldx > 0 ? ldx : w->ne0), (int) T, Y,
+                                              (int) (ldy > 0 ? ldy : w->ne1), 0.0f, gm.stream())) {
+            err = "prefill: " + name + ": the exl3 dense gemm was refused (matrix outside the vendored kernels)";
+            return false;
+        }
+        if (ct) g_cold.end("exl3", name, T, w->ne1, w->ne0);
+        return true;
+    }
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
     if (ct) g_cold.end("native", name, T, w->ne1, w->ne0);
     return true;
@@ -3857,8 +3870,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // KVA: the query projections have no consumer when only the KV/indexer state advances
                     if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     pt.mark(kPfQsaIdxG, cs);   // STRATA_PREFILL_TIMING: "qsa proj" is the k, v and q projections
-                    if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
-                    if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    // exl3-native packs (45/46): the prompt indexer projections take the F16 operand (m.mixed_h,
+                    // the same rows) on the vendored tensor-core gemm - bf16_proj would hand BF16 bits to a kernel
+                    // that reads them as F16.
+                    if (wik->native_type == 200) {
+                        if (!native_proj(m.gemm, wik, m.mixed_h, m.idx_raw, T, v.name("indexer.k_proj.weight"), err)) return false;
+                    } else if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    if (!kva_state_only && wiq->native_type == 200) {
+                        if (!native_proj(m.gemm, wiq, m.mixed_h, m.q_idx, T, v.name("indexer.q_proj.weight"), err)) return false;
+                    } else if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     pt.mark(kPfQsaPrep, cs);
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
@@ -6987,8 +7007,13 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                         if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
                         if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
-                        if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
-                        if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                        // exl3-native packs (45/46): F16 operand + vendored gemm (see the other region)
+                        if (wik->native_type == 200) {
+                            if (!native_proj(m.gemm, wik, m.mixed_h, m.idx_raw, T, v.name("indexer.k_proj.weight"), err)) return false;
+                        } else if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                        if (wiq->native_type == 200) {
+                            if (!native_proj(m.gemm, wiq, m.mixed_h, m.q_idx, T, v.name("indexer.q_proj.weight"), err)) return false;
+                        } else if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                         rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, cs);
                         rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), cs);
                         const bool staged = st.kv_mode == 1;

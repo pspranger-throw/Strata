@@ -4671,12 +4671,11 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: %zu exl3 dense linears, %.2f GiB of exl3 regions resident\n",
                      exl3_dense.tensor_count(), (double) exl3_dense.weight_bytes() / 1073741824.0);
-        // HOLD (remove with the C6.2 arms + boot sweep): until EVERY sidecar name has an exl3
-        // consumer arm, an unwired consumer would read the descriptor pointer as device data and
-        // produce plausible garbage.  Everything BEFORE this line is exactly the boot path the
-        // smoke run wants to prove (carrier parse, arena synthesis, region upload).
-        std::fprintf(stderr, "strata generate: exl3 dense consumer arms (C6.2) are not in this build yet\n");
-        return 1;
+        // C6.2 arms (45's inventory): decode goes through gemv_quantized/native_mmvq's 200 arm (the
+        // shared-expert native flags route the same), verify windows through the same native_mmvq
+        // plus the indexer mv arms, prefill through native_proj/exl3_dense_gemm plus the F16 indexer
+        // sites, and lm_head through gemv_quantized with bb.mixed.  An unwired path would read null
+        // planes or trip native_mmvq's throw - hard stops, never plausible garbage.
     }
 
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);

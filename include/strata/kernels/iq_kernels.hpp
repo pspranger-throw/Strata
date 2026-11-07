@@ -56,6 +56,22 @@ struct Exl3DenseDesc {
     int k = 0, n = 0, K = 0, cb = 2;
 };
 
+/// C6.2: y = x W for an exl3 dense linear, x as q8_1 blocks (the native_mmvq scratch: the vendored
+/// mv kernel reads the same ggml block_q8_1 layout).  ncol activations (a verify window's tokens):
+/// column c's xq at xq + c * xq_cs BYTES, its y at y + c * y_cs FLOATS (the vendored MvJob's own
+/// stride units); ncol 1 = a decode gemv.  More columns than one job takes (mv_cols) are run in
+/// runs internally, each y bit-for-bit its own job's.  false = not covered (bad desc/dims, ncol
+/// over 16, or no bridge in this build): a consumer must treat that as fatal, never fall through
+/// to canonical bytes (200 tensors have none) or read the desc pointer as device data.
+bool exl3_dense_mvq(const Exl3DenseDesc* d, const void* xq, size_t xq_cs, float* y, size_t y_cs, int ncol,
+                    void* stream);
+/// C6.2 prompt path (45/46): Y[r] = beta*Y[r] + X[r] W over the desc's region, via the vendored
+/// tensor-core gemm - it reads the exl3 trellis directly (no dequant staging).  x16 is the prefill's
+/// F16 activation rows (ldx values apart), rows <= T, y's rows ldy FLOATS apart.  false = not
+/// covered (bad desc, no mma on this device, no bridge): fatal for the chunk, never a silent zero.
+bool exl3_dense_gemm(const Exl3DenseDesc* d, const uint16_t* x16, int ldx, int rows, float* y, int ldy,
+                     float beta, void* stream);
+
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
 struct NativeExpertLayout {    int gu_type = -1, d_type = -1;
     int64_t n_embd = 0, n_ff = 0;

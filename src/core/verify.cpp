@@ -962,6 +962,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
+        xq_ik_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes((int) N, (int) T));   // exl3 indexer mv arms (46)
+        xq_iq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes((int) N, (int) T));
         scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
         if (select_long_on() && strata::kernels::qsa_topk_multi_scratch_ints(T) > 0)   // STRATA_SELECT_LONG only
             topk_scratch_ = b.take<int32_t>((uint64_t) strata::kernels::qsa_topk_multi_scratch_ints(T));
@@ -1720,6 +1722,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     norm_rope_on(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH, df_side_[0]);
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, df_side_[0]);   // <Hq, Hk> = <q, k>
                     fork(1);
+                    if (wiq->native_type == 200) {   // exl3-native packs (45/46): the mv arm on this branch too
+                        strata::kernels::native_quantize_q8_1(mixed_ + tb * N, xq_iq_, (int) N, n, df_side_[1]);
+                        native_mmvq(wiq->native_type, wiq->native_data, xq_iq_, qidx_ + tb * IQ * ID,
+                                    (int) N, (int) (IQ * ID), n, df_side_[1]);
+                    } else
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
                                               IQ * ID, N, IQ * ID, n, df_side_[1]);
                     norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
@@ -1739,7 +1746,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     norm_rope_on(data, norm, rows, cols, pos, ns);
                 };
                 auto idx_key = [&](cudaStream_t ns) {
-                    if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, ns);
+                    if (wik->native_type == 200) {   // exl3-native packs (45/46): the k projection is an mv
+                        // over the window: one q8_1 image of the mixed_ rows, then the vendored multi-column mv.
+                        strata::kernels::native_quantize_q8_1(mixed_ + tb * N, xq_ik_, (int) N, n, ns);
+                        native_mmvq(wik->native_type, wik->native_data, xq_ik_, idx_raw + tb * ID, (int) N, (int) ID, n, ns);
+                    } else if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, ns);
                     else for (int t = tb; t < te; ++t)
                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, ns);
                 };
@@ -1769,6 +1780,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 };
                 auto idx_query = [&](cudaStream_t ns) {
+                    if (wiq->native_type == 200) {   // exl3-native packs (45/46): the mv arm of idx_key's q
+                        // side, on its own scratch - with the df-branch switch k may be mid-window on another stream.
+                        strata::kernels::native_quantize_q8_1(mixed_ + tb * N, xq_iq_, (int) N, n, ns);
+                        native_mmvq(wiq->native_type, wiq->native_data, xq_iq_, qidx_ + tb * IQ * ID,
+                                    (int) N, (int) (IQ * ID), n, ns);
+                        norm_rope_s(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, ns);
+                        return;
+                    }
                     if (qb) {
                         bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                                   N, IQ * ID, n, ns);

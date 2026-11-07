@@ -5597,6 +5597,79 @@ void iq_dequant_f16_exl3(int K, const void* down, int64_t n_ff, int64_t n_embd, 
         std::exit(1);
     }
 }
+
+// ---- C6.2: the DENSE arms (45/46) ---- y = x W over an Exl3DenseDesc (the provider's device
+// region).  x arrives as q8_1 blocks: native_mmvq's activation scratch is ggml block_q8_1 and the
+// vendored mv kernel reads that layout (src/dsv41/vendor/exl3.cu's Q81: half2 ds + 32 int8, the
+// same 36 bytes), so the decode/verify paths quantize x once and every dense linear reuses it.
+// The launch-error discipline from round 2 wraps every call: an async fault must fail the token,
+// never leave plausible garbage in y.
+namespace {
+strata::dsv41k::exl3::Mat dense_mat(const Exl3DenseDesc* d) {
+    namespace ek = strata::dsv41k::exl3;
+    ek::Mat m;
+    m.trellis = (const uint32_t*) d->base;
+    const size_t tb = ek::trellis_bytes(d->k, d->n, d->K);
+    m.suh = (const uint16_t*) ((const uint8_t*) d->base + tb);
+    m.svh = m.suh + d->k;
+    m.k = d->k; m.n = d->n; m.K = d->K; m.cb = d->cb;
+    return m;
+}
+}  // namespace
+
+bool exl3_dense_mvq(const Exl3DenseDesc* d, const void* xq, size_t xq_cs, float* y, size_t y_cs, int ncol,
+                    void* stream) {
+    namespace ek = strata::dsv41k::exl3;
+    if (d == nullptr || d->base == nullptr || xq == nullptr || y == nullptr || ncol < 1 || ncol > ek::kMaxMvCols)
+        return false;
+    if (d->k <= 0 || d->n <= 0 || d->k % 32 != 0) return false;   // q8_1 input blocks of 32
+    ek::Mat m = dense_mat(d);
+    if (!ek::supported(m)) return false;
+    // the device may hold fewer columns in one job than the caller carries: run in runs (the API's
+    // own contract for mv_cols).  ncol <= 16 always (the verify window cap), so at most a few runs.
+    const int per = ek::mv_cols(m);
+    if (per < 1) return false;
+    const int le0 = ek::launch_errors();
+    for (int c0 = 0; c0 < ncol; c0 += per) {
+        ek::MvJob job{};
+        // per-column offsets in the API's own units (exl3.cu's split loop at :1464: xq advances by
+        // BYTES, y by FLOATS; the stride fields carry the same units for the kernel's own indexing
+        // across its input splits - a bytes/floats mix-up here silently scales every column).
+        job.m = &m;
+        job.xq = (const uint8_t*) xq + (size_t) c0 * xq_cs;
+        job.xq_cs = xq_cs;
+        job.y = y + (size_t) c0 * y_cs;
+        job.y_cs = y_cs;
+        job.ncol = ncol - c0 < per ? ncol - c0 : per;
+        if (!ek::mv(&job, 1, (cudaStream_t) stream)) {
+            std::fprintf(stderr, "exl3_dense_mvq: mv refused (k %d n %d K %d ncol %d)\n", d->k, d->n, d->K, ncol);
+            return false;
+        }
+    }
+    if (ek::launch_errors() != le0) {
+        std::fprintf(stderr, "exl3_dense_mvq: mv fault (k %d n %d K %d ncol %d)\n", d->k, d->n, d->K, ncol);
+        return false;
+    }
+    return true;
+}
+
+bool exl3_dense_gemm(const Exl3DenseDesc* d, const uint16_t* x16, int ldx, int rows, float* y, int ldy,
+                     float beta, void* stream) {
+    namespace ek = strata::dsv41k::exl3;
+    if (d == nullptr || d->base == nullptr || x16 == nullptr || y == nullptr || rows <= 0 || ldx <= 0 || ldy <= 0)
+        return false;
+    if (d->k <= 0 || d->n <= 0) return false;
+    if (!ek::mma_supported()) return false;            // the prompt path's tensor-core family (sm_80+)
+    ek::Mat m = dense_mat(d);
+    if (!ek::supported(m)) return false;
+    const int le0 = ek::launch_errors();
+    ek::gemm_rows(m, x16, ldx, rows, y, ldy, beta, (cudaStream_t) stream);
+    if (ek::launch_errors() != le0) {
+        std::fprintf(stderr, "exl3_dense_gemm: fault (k %d n %d K %d rows %d)\n", d->k, d->n, d->K, rows);
+        return false;
+    }
+    return true;
+}
 #else
 bool native_expert_grouped_exl3(const NativeExpertLayout&, const unsigned long long*, const int32_t*,
                                 const int32_t*, const int32_t*, int64_t, int, const float*, void*, float*, void*) {
@@ -5614,6 +5687,8 @@ void iq_dequant_f16_exl3(int, const void*, int64_t, int64_t, uint16_t*, void*) {
     std::fprintf(stderr, "iq_dequant_f16_exl3: this engine was built without STRATA_BUILD_DSV41\n");
     std::exit(1);
 }
+bool exl3_dense_mvq(const Exl3DenseDesc*, const void*, size_t, float*, size_t, int, void*) { return false; }
+bool exl3_dense_gemm(const Exl3DenseDesc*, const uint16_t*, int, int, float*, int, float, void*) { return false; }
 #endif
 
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int K) {

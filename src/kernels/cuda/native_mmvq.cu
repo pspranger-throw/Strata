@@ -3496,7 +3496,12 @@ bool native_mmvq_supported(int ggml_type) noexcept {
     return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
+           ggml_type == 21 || ggml_type == 22 || ggml_type == 29 ||
+           // exl3-native packs (45/46): the dense linears' data is an Exl3DenseDesc and native_mmvq's
+           // 200 arm routes it to the vendored mv.  A build without the dsv41 bridge refuses such a
+           // pack at startup, so on every build that reaches this predicate for a 200 ref the arm
+           // exists; and without it consumers would read the rows' canonical codes - which are none.
+           ggml_type == 200;
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
@@ -3515,6 +3520,14 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 42: block_elems = 64; block_bytes = 18; break;
     case 16: case 17: case 18: case 21: case 22: case 29:
         block_elems = 256; block_bytes = (int) iq_row_bytes(ggml_type, 256); break;
+    case 200:
+        // exl3-native packs (45/46): a 200 weight is a dense.bin region whose byte count (trellis K)
+        // this function cannot see; the provider validated it at load.  Callers on a 200 ref use
+        // only this function's throw (native_dense/native_head never see 200), so check the shape's
+        // form and return 0 - never allocate from it.
+        if (n_in <= 0 || n_out <= 0 || n_in % 128 != 0 || n_out % 128 != 0)
+            throw std::invalid_argument("exl3 (200) native MMVQ: shape outside the pack's contract");
+        return 0;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
     validate_shape(n_in, 1, block_elems);
@@ -3553,6 +3566,21 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 200: {
+        // exl3-native packs (45/46): the dense linears are regions of the pack's dense.bin, and
+        // `weights` is the provider's HOST Exl3DenseDesc* (Exl3Dense publishes it on the reference;
+        // the arena's kind-Exl3 rows carry no canonical bytes).  x_q8_1 is the caller's activation
+        // scratch, a ggml block_q8_1 per 32 inputs - the layout the vendored mv kernel's Q81 reads.
+        // The descriptor's shape must agree with the call: a mismatch would decode another
+        // tensor's bytes.  A build without the dsv41 bridge refuses (false), and such a build
+        // already refused the pack at startup - the throw keeps a silent fallthrough impossible.
+        const Exl3DenseDesc* d = static_cast<const Exl3DenseDesc*>(weights);
+        if (d == nullptr || d->k != n_in || d->n != n_out)
+            throw std::invalid_argument("exl3 (200) native MMVQ: the descriptor does not match the call shape");
+        if (!exl3_dense_mvq(d, x_q8_1, std::size_t(n_in / Q8K) * sizeof(Q81Block), y, n_out, ncols, stream))
+            throw std::invalid_argument("exl3 (200) native MMVQ: the dense mv was refused");
+        break;
+    }
     case 16: case 17: case 18: case 21: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
