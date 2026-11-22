@@ -15810,6 +15810,7 @@ int main(int argc, char** argv) {
             strata::core::SavedConversation image;   // running state + K/V headers; the K/V buffers stay empty
             std::vector<std::array<uint64_t, 5>> file_kv;   // the K/V sizes exactly as the read pass parsed them
             size_t bytes = 0;
+            const auto* session_draft = use_mtp ? &mtp.kv_state() : nullptr;   // #1492 (port 2026-11-22): sessions save/restore drafter-less too
             try {
                 // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every state and
                 // K/V part), checked as the file is parsed and before each array is allocated; the file size follows
@@ -15817,6 +15818,7 @@ int main(int argc, char** argv) {
                 strata::core::SessionReadLimits limits;
                 limits.progress = moving;
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                pools_budget.shrink((size_t) -1);   // the park pools' idle memory goes back before the RAM checks of a session load (upstream #69857af, port 2026-11-22)
                 limits.admit = [floor, &o](uint64_t need, std::string& why) {
                     const auto mem = strata::core::sample_host_memory();
                     const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
@@ -15827,7 +15829,7 @@ int main(int argc, char** argv) {
                     return false;
                 };
                 if (!strata::core::conversation_session_read_limits(
-                        limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                        limits, ss, g, session_draft, (uint64_t) o.max_context,
                         (uint64_t) std::max(o.prompt_cache, 1), err)) {
                     return refuse(err, strata::core::SessionError::io);
                 }
@@ -15841,7 +15843,7 @@ int main(int argc, char** argv) {
             // the whole running state against this engine, still without any device write; a K/V layer of another
             // geometry or extent is refused here, by its header
             blocking("validate", bytes);
-            if (!strata::core::conversation_snapshot_validate_meta(image, ss, g, mtp.kv_state(), err))
+            if (!strata::core::conversation_snapshot_validate_meta(image, ss, g, session_draft, err))
                 return refuse(err);
             // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
             if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce))
@@ -15849,7 +15851,7 @@ int main(int argc, char** argv) {
                               strata::core::SessionError::memory);
             // bind every layer's authoritative pool (validated above; this cannot fail for a good image)
             std::vector<strata::core::ConversationKvTarget> targets;
-            if (!strata::core::conversation_kv_targets(image, ss, g, mtp.kv_state(), targets, err))
+            if (!strata::core::conversation_kv_targets(image, ss, g, session_draft, targets, err))
                 return refuse(err);
             if (cudaDeviceSynchronize() != cudaSuccess)
                 return refuse("the device did not go quiet before the restore", strata::core::SessionError::io);
@@ -15939,16 +15941,6 @@ int main(int argc, char** argv) {
             std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
             return 0;
         };
-        if (!o.session_restore_at_start.empty()) {
-            std::string dir = o.session_restore_at_start;
-            while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\')) dir.pop_back();
-            const std::string start_file = dir + "/session.bin";
-            const int rc = restore_disk_session(start_file, true);
-            if (rc == 1) return 1;   // the store left the device state touched: never serve from it
-            if (rc == 2)
-                std::fprintf(stderr, "strata serve: --session-restore-at-start: %s refused; starting cold\n",
-                             start_file.c_str());
-        }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
 #if defined(STRATA_USE_HIP) && defined(__linux__)
@@ -16012,6 +16004,20 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - w0).count(), wok ? "" : "; a window failed: ",
                              wok ? "" : werr.c_str());
             }
+        }
+        // (v0.2.19 ordering, port 2026-11-22 review B): the window warm-up above ends in session_zero() on the
+        // live session, so the startup restore must run AFTER it — restoring before the warm-up would hand every
+        // save-on-stop boot a restored-then-zeroed session. Parity: the server's own restore_after_load also runs
+        // after load/warm-up; running here also means admission sees the load's pin headroom released.
+        if (!o.session_restore_at_start.empty()) {
+            std::string dir = o.session_restore_at_start;
+            while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\')) dir.pop_back();
+            const std::string start_file = dir + "/session.bin";
+            const int rc = restore_disk_session(start_file, true);
+            if (rc == 1) return 1;   // the store left the device state touched: never serve from it
+            if (rc == 2)
+                std::fprintf(stderr, "strata serve: --session-restore-at-start: %s refused; starting cold\n",
+                             start_file.c_str());
         }
         g_gpu_pause_idle.idle(gpu_pause_now());   // AMD on Linux: the gap before the first request starts here (the start-up's own pauses are not a "between")
         std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
